@@ -9,78 +9,62 @@
 #include <string.h>
 #include <unistd.h>
 #include <execinfo.h>
+#include <pthread.h>
 
-#define MALLOC_SYMBOL "malloc"
-#define FREE_SYMBOL "free"
-#define REALLOC_SYMBOL "realloc"
+#ifdef NDEBUG
+#define LOG(...) ((void)0)
+#else
+#define LOG(...) printf(__VA_ARGS__)
+#endif
 
 enum WrapperState {
     WRAPPER_UNINITIALIZED,
     WRAPPER_INITIALIZING,
     WRAPPER_INITIALIZED
 };
+static enum WrapperState wrapper_state = WRAPPER_UNINITIALIZED;
 
 static void *(*libc_malloc) (size_t) = 0;
 static void (*libc_free) (void *) = 0;
 static void *(*libc_realloc) (void*, size_t) = 0;
-
-static enum WrapperState wrapper_state = WRAPPER_UNINITIALIZED;
-#define WRAPPER_INITIALIZING_INTERVAL 10 // 10 ms
+static void *(*libc_calloc) (size_t, size_t) = 0;
 
 static int use_origin_malloc = 0;
+static void *handle = 0;
 static FILE* mallstream = 0;
-
-#define NAME_OF_LIBC "/lib/x86_64-linux-gnu/libc.so.6"
-#define MALL_FILE "malloctrace.log"
-
-#if 0
 static pthread_mutex_t lock;
-static int lock_result;
-
 
 #define TRYLOCKMUTEX {\
     lock_resutl = pthread_mutex_trylock(&lock);\
-    use_origin_malloc = 1;\
 }
 #define UNLOCKMUTEX {\
-    use_origin_malloc = 0;\
     if (!lock_resutl)\
         pthread_mutex_unlock(&lock);\
 }
-#endif
 
-void trwhere()
+// simplemtrace_init will be called before main()
+static int simplemtrace_init() __attribute__((constructor));
+static void aexit_callback(void);
+
+static int simplemtrace_init()
 {
-#define BTSZ 10
-#define BTAL 20
-    void* bt[BTSZ];
-    int btc, i;
-    char btstr[BTSZ*BTAL];
-    memset(btstr, ' ', BTSZ*BTAL);
-
-    use_origin_malloc = 1;   
-    btc = backtrace(bt, BTSZ);
-    use_origin_malloc = 0;
-
-    for (i = 3; i < btc; ++i) {
-        snprintf(btstr+(i-3)*BTAL, BTAL, "%p", bt[i]);
-    }
-    for (i = 0; i <BTSZ*BTAL; i++) {
-        if (btstr[i] == '\0')
-            btstr[i] = ' ';
-    }
-    *(btstr+BTSZ*BTAL-1) = '\n';
-    fwrite(btstr, 1, BTSZ*BTAL, mallstream);
-}
-
-static void load_libc()
-{
-    void *handle;
     const char *err;
     const char *libcname;
-    
+    const char* mallfile = "malloctrace.log";
+    const char* malloc_symbol = "malloc";
+    const char* free_symbol = "free";
+    const char* realloc_symbol = "realloc";
+    const char* calloc_symbol = "calloc";
+
+// TODO...
+// define NAME_OF_LIBC in Makefile
+#define NAME_OF_LIBC "/lib/x86_64-linux-gnu/libc.so.6"
     libcname = NAME_OF_LIBC;
-    
+
+    if (mallstream)
+        return 0;
+
+    use_origin_malloc = 1;
     handle = dlopen(libcname, RTLD_NOW);
     if ((err = dlerror()))
     {
@@ -91,84 +75,69 @@ static void load_libc()
         printf("%s", err);
         printf("\n");
         exit(1);
+        return 1;
     }
     
-    libc_malloc = (void *(*)(size_t))dlsym(handle, MALLOC_SYMBOL);
+    libc_malloc = (void *(*)(size_t))dlsym(handle, malloc_symbol);
     if ((err = dlerror()))
     {
         printf("*** wrapper does not find `");
-        printf("%s", MALLOC_SYMBOL);
+        printf("%s", malloc_symbol);
         printf("' in `libc.so'!\n");
         exit(1);
+        return 1;
     }
     
-    libc_free = (void (*)(void *))dlsym(handle, FREE_SYMBOL);
+    libc_free = (void (*)(void *))dlsym(handle, free_symbol);
     if ((err = dlerror()))
     {
         printf("*** wrapper does not find `");
-        printf("%s", FREE_SYMBOL);
+        printf("%s", free_symbol);
         printf("' in `libc.so'!\n");
         exit(1);
+        return 1;
     }
 
-    use_origin_malloc = true;
+    libc_calloc = (void *(*)(size_t, size_t))dlsym(handle, calloc_symbol);
+    if ((err = dlerror()))
+    {
+        printf("*** wrapper does not find `");
+        printf("%s", calloc_symbol);
+        printf("' in `libc.so'!\n");
+        exit(1);
+        return 1;
+    }
+
+    libc_realloc = (void *(*)(void*, size_t))dlsym(handle, realloc_symbol);
+    if ((err = dlerror()))
+    {
+        printf("*** wrapper does not find `");
+        printf("%s", realloc_symbol);
+        printf("' in `libc.so'!\n");
+        exit(1);
+        return 1;
+    }
+
+    if (pthread_mutex_init(&lock, 0)) {
+        printf("*** fail to init mutext \n");
+        exit(1);
+        return 1;
+    }
+
+    mallstream = fopen(mallfile, "w+");
     if (!mallstream) {
-        mallstream = fopen(MALL_FILE, "w+");
-        if (!mallstream) {
-            printf("*** can't open mall file\n");
-            exit(1);
-        }
+        printf("*** can't open mall file\n");
+        exit(1);
+        return 1;
     }
-    use_origin_malloc = false;   
+
+    use_origin_malloc = 0;
+
+    return 0;
 }
 
-static size_t er_malloc_cc = 0;
-static size_t er_free_cc = 0;
-
-static void* er_malloc(size_t sz)
-{
-    void* p = libc_malloc(sz);
-    if (p) {
-        fprintf(mallstream, "+%p %#lx ", p, (unsigned long int)sz);
-        trwhere();
-        er_malloc_cc++;
-    }
-    return p;
-}
-
-static char s_mem_pool[1024];
-char* s_mem_bottom = s_mem_pool;
-char* s_mem_top = s_mem_pool + 1024;
-char* s_mem_next = s_mem_pool;
-
-static void* er_static_malloc(size_t sz)
-{
-    if (s_mem_next + sz > s_mem_top) {
-        printf("static memory pool is full");
-        return 0;
-    }
-    void* p = (void*)s_mem_next;
-    printf("malloc %p from static memory pool[%p ---> %p]\n", p, s_mem_bottom, s_mem_top);
-    s_mem_next += sz;
-    return p;
-}
-
-static void er_free(void* p)
-{
-    if (((char*)p - s_mem_bottom) >= 0 && (s_mem_top - (char*)p) >= 0) {
-        printf("free %p which is static memory pool[%p ---> %p], do nothing\n", p, s_mem_bottom, s_mem_top);
-        return;
-    }
-
-    if (p) {
-        if (!use_origin_malloc) {
-            fprintf(mallstream, "-%p\n", p);
-            er_free_cc++;
-        }
-    }
-
-    return libc_free(p);
-}
+#define BTSZ 10
+#define BTAL 20
 
 typedef struct _mnode{
     void* p;
@@ -228,7 +197,8 @@ static int detectmemoryleak()
         return 0;
     char* line = 0;
     mnode* list = 0;
-    int lc = 0;
+    size_t lc = 0;
+    int index = 0;
 
     fflush(mallstream);
     fseek(mallstream, 0, SEEK_SET);
@@ -255,8 +225,9 @@ static int detectmemoryleak()
         int i;
         mnode* mn = list;
         list = list->next;
-        lc++;
-        printf("MEMORYLEAK[%d]###########################################################################\n", lc);
+        lc += mn->sz;
+        index++;
+        printf("MEMORYLEAK[%d]###########################################################################\n", index);
         printf("leak memory [%p, %ld]", mn->p, mn->sz);
         printf("back trace:\n");
         for (i = 0; i < BTSZ; i++) {
@@ -273,19 +244,20 @@ static int detectmemoryleak()
             printf("#%d\t%p\t%s\t%s\n", i+1, mn->bt[i], objectpath, functionname);
         }
         free(mn);
-        printf("MEMORYLEAK[%d]###########################################################################\n", lc);
+        printf("MEMORYLEAK[%d]###########################################################################\n", index);
     }
 
     return lc;
 }
 
-static void aexit_callback(void)
+static int simplemtrace_finalize() __attribute__((destructor));
+static int simplemtrace_finalize()
 {
 #define COLOR_NONE "\033[0;0m"
 #define COLOR_RED "\033[5;31m"
 #define COLOR_GREEN "\033[0;42m"
 #define COLOR_YELLOW "\033[0;33m"
-    int memoryleaked = 0;
+    size_t memoryleaked = 0;
 
     printf(COLOR_YELLOW"exit main function, let's check memory leak\n");
     use_origin_malloc = 1;
@@ -297,45 +269,134 @@ static void aexit_callback(void)
     if (memoryleaked) {
         printf(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
         printf(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        printf(COLOR_RED"[%ld] memory leak deteckted\n", er_malloc_cc - er_free_cc);
-        printf(COLOR_RED"[%ld] memory leak deteckted\n", er_malloc_cc - er_free_cc);
+        printf(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
+        printf(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
         printf(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
         printf(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
     } else
         printf(COLOR_GREEN"GOOD PROGRAM, NO MEMORY LEAK\n");
     printf(COLOR_NONE"\n");
+
+    if (handle)
+        dlclose(handle);
+
+    pthread_mutex_destroy(&lock);
+}
+
+void tr_where()
+{
+#define BTSZ 10
+#define BTAL 20
+    void* bt[BTSZ];
+    int btc, i;
+    char btstr[BTSZ*BTAL];
+    int l = 0;
+    memset(btstr, ' ', BTSZ*BTAL);
+
+    l = pthread_mutex_trylock(&lock);
+    use_origin_malloc = 1;   
+    btc = backtrace(bt, BTSZ);
+    use_origin_malloc = 0;
+
+    for (i = 2; i < btc; ++i) {
+        snprintf(btstr+(i-2)*BTAL, BTAL, "%p", bt[i]);
+    }
+    for (i = 0; i <BTSZ*BTAL; i++) {
+        if (btstr[i] == '\0')
+            btstr[i] = ' ';
+    }
+    fprintf(mallstream, "%s \n", btstr);
+    if (!l)
+        pthread_mutex_unlock(&lock);
+}
+
+// memory pool for malloc/realloc/ccalloc before simpletrace initialized
+static char memorypool[1024];
+static int pool_index = 0;
+static void* poolmax = (void*)(memorypool + 1024);
+void* mfp(size_t sz)
+{
+    if ((memorypool + pool_index + sz) >= poolmax) {
+        printf("memory pool is not big enough");
+        return 0;
+    }
+    void* r = (void*)(memorypool + pool_index);
+    pool_index += sz;
+    return r;
 }
 
 void* malloc(size_t sz)
 {
-    void* p = 0;
-    if (use_origin_malloc) {
-        return libc_malloc(sz);
+    void* r = 0;
+    int l = 0;
+    if (!libc_malloc) {
+        return mfp(sz);
     }
-    switch (wrapper_state) {
-    case WRAPPER_UNINITIALIZED:
-        wrapper_state = WRAPPER_INITIALIZING;
-        load_libc();
-        atexit(aexit_callback);
-        wrapper_state = WRAPPER_INITIALIZED;
-    case WRAPPER_INITIALIZED:
-        p = er_malloc(sz);
-        break;
-    case WRAPPER_INITIALIZING:
-        p = er_static_malloc(sz);
-        break;
-    default:
-        break;
+    r = libc_malloc(sz);
+    l = pthread_mutex_trylock(&lock);
+    if (!use_origin_malloc && r) {
+        LOG("malloc(%ld) return %p\n", sz, r);
+        fprintf(mallstream, "+%p %#lx ", r, sz);
+        tr_where();
     }
-    return p;
+    if (!l)
+        pthread_mutex_unlock(&lock);
+    return r;
+}
+
+void* calloc(size_t nitems, size_t sz)
+{
+    void* r = 0;
+    int l = 0;
+    if (!libc_calloc) {
+        return mfp(sz*nitems);
+    }
+    r = libc_calloc(nitems, sz);
+    l = pthread_mutex_trylock(&lock);
+    if (!use_origin_malloc && r) {
+        LOG("calloc(%ld, %ld) return %p\n", nitems, sz, r);
+        fprintf(mallstream, "+%p %#lx ", r, sz*nitems);
+        tr_where();
+    }
+    if (!l)
+        pthread_mutex_unlock(&lock);
+    return r;
+}
+
+void* realloc(void* p, size_t sz)
+{
+    void* r = 0;
+    int l = 0;
+    if (!libc_realloc) {
+        return mfp(sz);
+    }
+    r = libc_realloc(p, sz);
+    l = pthread_mutex_trylock(&lock);
+    if (!use_origin_malloc && r) {
+        LOG("realloc(%p, %ld) return %p\n", p, sz, r);
+        fprintf(mallstream, "+%p %#lx ", r, sz);
+        tr_where();
+    }
+    if (!l)
+        pthread_mutex_unlock(&lock);
+    return r;
 }
 
 void free(void* p)
 {
-    if (wrapper_state == WRAPPER_INITIALIZED)
-        er_free(p);
-    else {
-        printf("call free before malloc\n");
-        exit(1);
+    if (p) {
+        int l = 0;
+        if (p >= memorypool && p < poolmax) {
+            printf("free memory allocated from memory pool, do nothing");
+            return;
+        }
+        l = pthread_mutex_trylock(&lock);
+        if (!use_origin_malloc) {
+            LOG("free %p\n", p);
+            fprintf(mallstream, "-%p \n", p);
+        }
+        if (!l)
+            pthread_mutex_unlock(&lock);
+        libc_free(p);
     }
 }
