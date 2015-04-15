@@ -57,21 +57,15 @@ main(int argc, char *argv[])
 
     /* The "-s" option specifies a stack size for our threads */
 
-    stack_size = -1;
-    while ((opt = getopt(argc, argv, "s:")) != -1) {
-        switch (opt) {
-        case 's':
-            stack_size = strtoul(optarg, NULL, 0);
-            break;
-
-        default:
-            fprintf(stderr, "Usage: %s [-s stack-size] arg...\n",
-                    argv[0]);
-            exit(EXIT_FAILURE);
-        }
-    }
-
-    num_threads = argc - optind;
+    // Fix me, if stack_size != [0x10000000], always report below memory leak
+    //leak memory [0x122c560, 304]back trace:
+    //#1      0x7f8f69af5e55  /lib64/ld-linux-x86-64.so.2     _dl_allocate_tls
+    //#2      0x7f8f696c9da1  /lib/x86_64-linux-gnu/libpthread.so.0   pthread_create
+    //#3      0x4014dd        ./out/smtest    (nul)
+    //#4      0x7f8f69018ec5  /lib/x86_64-linux-gnu/libc.so.6 __libc_start_main
+    //#5      0x401129        ./out/smtest    (nul)
+    stack_size = 0x10000000;
+    num_threads = argc - 1;
 
     /* Initialize thread creation attributes */
 
