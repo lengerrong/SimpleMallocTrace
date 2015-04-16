@@ -4,6 +4,10 @@ project(SimpleMallocTrace)
 SET (SOURCE
     smtest.cpp
     simplemtrace.cpp
+    Symbolize.h
+    Symbolize.cpp
+    Demangle.h
+    Demangle.cpp
 )
 
 macro(findNameofLIBC)

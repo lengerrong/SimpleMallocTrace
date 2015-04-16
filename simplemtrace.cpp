@@ -11,6 +11,8 @@
 #include <execinfo.h>
 #include <pthread.h>
 
+#include "Symbolize.h"
+
 extern "C" {
 
 static void *(*libc_malloc) (size_t) = 0;
@@ -151,6 +153,51 @@ void delmnode(mnode** mlp, char* line)
     }
 }
 
+typedef struct _Symbol {
+    void* address;
+    char symbol[1024];
+    struct _Symbol* next;
+} Symbol;
+
+char* findSymbol(Symbol* head, void* address)
+{
+    if (!head)
+        return 0;
+    while (head) {
+        if (head->address == address)
+            return head->symbol;
+        head = head->next;
+    }
+    return 0;
+}
+
+void addSymbol(Symbol** phead, void* address, char* symbol)
+{
+    Symbol* h = *phead;
+    Symbol* s = (Symbol*)malloc(sizeof(Symbol));
+    if (!s)
+        return;
+    s->address = address;
+    snprintf(s->symbol, sizeof(s->symbol), "%s", symbol);
+    s->next = 0;
+    if (h) {
+        while (h && h->next)
+            h = h->next;
+        h->next = s;
+    } else {
+        *phead = s;
+    }
+}
+
+void freeSymbols(Symbol* head)
+{
+    while (head) {
+        Symbol* s = head;
+        head = head->next;
+        free(s);
+    }
+}
+
 static int detectmemoryleak()
 {
     if (!mallstream)
@@ -159,6 +206,7 @@ static int detectmemoryleak()
     mnode* list = 0;
     size_t lc = 0;
     int index = 0;
+    Symbol* sl = 0;
 
     fflush(mallstream);
     fseek(mallstream, 0, SEEK_SET);
@@ -195,17 +243,30 @@ static int detectmemoryleak()
             const char* cxaDemangled = 0;
             const char* objectpath = 0;
             const char* functionname = 0;
+            char buf[1024] = { '\0' };
             if (!mn->bt[i])
                 break;
             dladdr(mn->bt[i], &info);
             objectpath = info.dli_fname ? info.dli_fname : "(nul)";
-            cxaDemangled = info.dli_sname ? abi::__cxa_demangle(info.dli_sname, 0, 0, 0) : "(nul)";
-            functionname = cxaDemangled ? cxaDemangled : info.dli_sname ? info.dli_sname : "(nul)";
-            printf("#%d\t%p\t%s\t%s\n", i+1, mn->bt[i], objectpath, functionname);
+            cxaDemangled = info.dli_sname ? abi::__cxa_demangle(info.dli_sname, 0, 0, 0) : 0;
+            functionname = cxaDemangled ? cxaDemangled : info.dli_sname ? info.dli_sname : 0;
+            if (!functionname) {
+                functionname = findSymbol(sl, static_cast<char*>(mn->bt[i]) - 1);
+            }
+            if (!functionname) {
+                void* address = static_cast<char*>(mn->bt[i]) - 1;
+                if (WTF::Symbolize(address, buf, sizeof(buf))) {
+                    functionname = buf;
+                    addSymbol(&sl, address, buf);
+                }
+            }
+            printf("#%d\t%p\t%s\t%s\n", i+1, mn->bt[i], objectpath, functionname ? functionname : "(null)");
         }
         free(mn);
         printf("MEMORYLEAK[%d]###########################################################################\n", index);
     }
+
+    freeSymbols(sl);
 
     return lc;
 }
