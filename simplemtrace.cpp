@@ -11,14 +11,7 @@
 #include <execinfo.h>
 #include <pthread.h>
 
-#ifdef NDEBUG
-#define LOG(...) ((void)0)
-#else
-#define LOG(...) {\
-    printf("T(%#lx) ", pthread_self()); \
-    printf(__VA_ARGS__); \
-}
-#endif
+extern "C" {
 
 static void *(*libc_malloc) (size_t) = 0;
 static void (*libc_free) (void *) = 0;
@@ -40,12 +33,9 @@ static int simplemtrace_initialize()
     const char* free_symbol = "free";
     const char* calloc_symbol = "calloc";
 
-// TODO...
-// define NAME_OF_LIBC in Makefile
-#define NAME_OF_LIBC "/lib/x86_64-linux-gnu/libc.so.6"
     libcname = NAME_OF_LIBC;
 
-    printf("before enter main(), let's initialize simple malloc trace\n");
+    printf("before enter main(), let's initialize simple malloc trace with %s\n", libcname);
 
     if (mallstream)
         return 0;
@@ -254,7 +244,6 @@ static void* poolmax = (void*)(memorypool + 1024);
 void* mfp(size_t sz)
 {
     if ((memorypool + pool_index + sz) >= poolmax) {
-        LOG("memory pool is not big enough");
         return 0;
     }
     void* r = (void*)(memorypool + pool_index);
@@ -270,7 +259,6 @@ void* malloc(size_t sz)
     }
     r = libc_malloc(sz);
     if (!use_origin_malloc && r) {
-        LOG("malloc(%ld) return %p\n", sz, r);
         tr_where('+', r, sz);
     }
     return r;
@@ -278,13 +266,17 @@ void* malloc(size_t sz)
 
 void* calloc(size_t nitems, size_t sz)
 {
+    printf("%s %d\n", __FILE__, __LINE__);
+
     void* r = 0;
     if (!libc_calloc) {
         return mfp(sz*nitems);
     }
     r = libc_calloc(nitems, sz);
+    printf("use_origin_malloc %d , r %p\n", use_origin_malloc, r);
+
     if (!use_origin_malloc && r) {
-        LOG("calloc(%ld, %ld) return %p\n", nitems, sz, r);
+        printf("calloc(%ld, %ld) return %p\n", nitems, sz, r);
         tr_where('+', r, sz*nitems);
     }
     return r;
@@ -294,11 +286,9 @@ void free(void* p)
 {
     if (p) {
         if (p >= memorypool && p < poolmax) {
-            LOG("free %p is in memory pool [%p, %p], do nothing!\n", p, memorypool, poolmax);
             return;
         }
         if (!use_origin_malloc) {
-            LOG("free %p\n", p);
             tr_where('-', p, 0);
         }
         libc_free(p);
@@ -342,4 +332,6 @@ static int simplemtrace_finalize()
         dlclose(handle);
 
     return 0;
+}
+
 }
