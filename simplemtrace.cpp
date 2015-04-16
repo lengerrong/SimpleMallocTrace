@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <execinfo.h>
 #include <pthread.h>
@@ -23,6 +24,20 @@ static __thread int use_origin_malloc = 0;
 static void *handle = 0;
 static FILE* mallstream = 0;
 
+static void getProcessName(pid_t pid, char* processName)
+{
+    char pp[1024];
+    char buf[1024];
+    FILE* fp = 0;
+    snprintf(pp, sizeof(pp), "/proc/%d/status", pid);
+    fp = fopen(pp, "r");
+    if (!fp)
+        return;
+    fgets(buf, sizeof(buf)-1, fp);
+    fclose(fp);
+    sscanf(buf, "%*s %s", processName);
+}
+
 // simplemtrace_init will be called before main()
 static int simplemtrace_initialize() __attribute__((constructor));
 
@@ -30,10 +45,12 @@ static int simplemtrace_initialize()
 {
     const char *err;
     const char *libcname;
-    const char* mallfile = "malloctrace.log";
     const char* malloc_symbol = "malloc";
     const char* free_symbol = "free";
     const char* calloc_symbol = "calloc";
+    char logpath[1024] = {'\0', };
+    char processName[1024] = {'\0', };
+    pid_t pid = getpid();
 
     libcname = NAME_OF_LIBC;
 
@@ -86,9 +103,11 @@ static int simplemtrace_initialize()
         return 1;
     }
 
-    mallstream = fopen(mallfile, "w+");
+    getProcessName(pid, processName);
+    snprintf(logpath, sizeof(logpath), "%s.%d.malloctrace", processName, pid);
+    mallstream = fopen(logpath, "w+");
     if (!mallstream) {
-        printf("*** can't open mall file\n");
+        printf("*** can't open mall file[%s]\n", logpath);
         exit(1);
         return 1;
     }
