@@ -25,7 +25,6 @@ static void *(*libc_aligned_alloc) (size_t, size_t);
 static void *(*libc_memalign) (size_t, size_t);
 
 static __thread int use_origin_malloc = 0;
-static void *handle = 0;
 static FILE* mallstream = 0;
 
 #define SMTLOG(...) printf(__VA_ARGS__)
@@ -50,7 +49,6 @@ static int simplemtrace_initialize() __attribute__((constructor));
 static int simplemtrace_initialize()
 {
     const char *err;
-    const char *libcname;
     const char* malloc_symbol = "malloc";
     const char* free_symbol = "free";
     const char* realloc_symbol = "realloc";
@@ -63,28 +61,12 @@ static int simplemtrace_initialize()
     char processName[1024] = {'\0', };
     pid_t pid = getpid();
 
-    libcname = NAME_OF_LIBC;
-
-    SMTLOG("before enter main(), let's initialize simple malloc trace with %s\n", libcname);
-
     if (mallstream)
         return 0;
 
     use_origin_malloc = 1;
-    handle = dlopen(libcname, RTLD_NOW);
-    if ((err = dlerror()))
-    {
-        SMTLOG("*** wrapper can not open `");
-        SMTLOG("%s", libcname);
-        SMTLOG("'!\n");
-        SMTLOG("*** dlerror() reports: ");
-        SMTLOG("%s", err);
-        SMTLOG("\n");
-        exit(1);
-        return 1;
-    }
     
-    libc_malloc = (void *(*)(size_t))dlsym(handle, malloc_symbol);
+    libc_malloc = (void *(*)(size_t))dlsym(RTLD_NEXT, malloc_symbol);
     if ((err = dlerror()))
     {
         SMTLOG("*** wrapper does not find `");
@@ -94,7 +76,7 @@ static int simplemtrace_initialize()
         return 1;
     }
     
-    libc_free = (void (*)(void *))dlsym(handle, free_symbol);
+    libc_free = (void (*)(void *))dlsym(RTLD_NEXT, free_symbol);
     if ((err = dlerror()))
     {
         SMTLOG("*** wrapper does not find `");
@@ -104,7 +86,7 @@ static int simplemtrace_initialize()
         return 1;
     }
 
-    libc_realloc = (void*(*)(void*, size_t))dlsym(handle, realloc_symbol);
+    libc_realloc = (void*(*)(void*, size_t))dlsym(RTLD_NEXT, realloc_symbol);
     if ((err = dlerror()))
     {
         SMTLOG("*** wrapper does not find `");
@@ -114,7 +96,7 @@ static int simplemtrace_initialize()
         return 1;
     }
 
-    libc_calloc = (void*(*)(size_t, size_t))dlsym(handle, calloc_symbol);
+    libc_calloc = (void*(*)(size_t, size_t))dlsym(RTLD_NEXT, calloc_symbol);
     if ((err = dlerror()))
     {
         SMTLOG("*** wrapper does not find `");
@@ -124,7 +106,7 @@ static int simplemtrace_initialize()
         return 1;
     }
 
-    libc_posix_memalign = (int (*)(void**, size_t, size_t))dlsym(handle, posix_memalign_symbol);
+    libc_posix_memalign = (int (*)(void**, size_t, size_t))dlsym(RTLD_NEXT, posix_memalign_symbol);
     if ((err = dlerror()))
     {
         SMTLOG("*** wrapper does not find `");
@@ -134,7 +116,7 @@ static int simplemtrace_initialize()
         return 1;
     }
 
-    libc_aligned_alloc = (void*(*)(size_t, size_t))dlsym(handle, aligned_alloc_symbol);
+    libc_aligned_alloc = (void*(*)(size_t, size_t))dlsym(RTLD_NEXT, aligned_alloc_symbol);
     if ((err = dlerror()))
     {
         SMTLOG("*** wrapper does not find `");
@@ -144,7 +126,7 @@ static int simplemtrace_initialize()
         return 1;
     }
 
-    libc_memalign = (void*(*)(size_t, size_t))dlsym(handle, memalign_symbol);
+    libc_memalign = (void*(*)(size_t, size_t))dlsym(RTLD_NEXT, memalign_symbol);
     if ((err = dlerror()))
     {
         SMTLOG("*** wrapper does not find `");
@@ -547,9 +529,6 @@ static int simplemtrace_finalize()
     } else
         SMTLOG(COLOR_GREEN"GOOD PROGRAM, NO MEMORY LEAK\n");
     SMTLOG(COLOR_NONE"\n");
-
-    if (handle)
-        dlclose(handle);
 
     return 0;
 }
