@@ -16,18 +16,107 @@
 
 extern "C" {
 
-static void *(*libc_malloc) (size_t) = 0;
-static void (*libc_free) (void *) = 0;
-static void *(*libc_realloc) (void*, size_t) = 0;
-static void *(*libc_calloc) (size_t, size_t) = 0;
-static int (*libc_posix_memalign) (void**, size_t, size_t);
-static void *(*libc_aligned_alloc) (size_t, size_t);
-static void *(*libc_memalign) (size_t, size_t);
+typedef void * (*MALLOC_FUNCTION) (size_t);
+typedef void * (*CALLOC_FUNCTION) (size_t, size_t);
+typedef void * (*REALLOC_FUNCTION) (void*, size_t);
+typedef void (*FREE_FUNCTION) (void*);
+typedef void (*CFREE_FUNCTION) (void*);
+typedef void * (*MEMALIGN_FUNCTION) (size_t, size_t);
+typedef void * (*ALIGNED_ALLOC_FUNCTION) (size_t, size_t);
+typedef int (*POSIX_MEMALIGN_FUNCTION) (void**, size_t, size_t);
 
-static __thread int use_origin_malloc = 0;
+static __thread MALLOC_FUNCTION libc_malloc = 0;
+static __thread CALLOC_FUNCTION libc_calloc = 0;
+static __thread REALLOC_FUNCTION libc_realloc = 0;
+static __thread FREE_FUNCTION libc_free = 0;
+static __thread CFREE_FUNCTION libc_cfree = 0;
+static __thread MEMALIGN_FUNCTION libc_memalign = 0;
+static __thread ALIGNED_ALLOC_FUNCTION libc_aligned_alloc = 0;
+static __thread POSIX_MEMALIGN_FUNCTION libc_posix_memalign = 0;
+
+static __thread int use_origin_malloc = 1;
+static __thread int malloc_for_dlsym = 0;
+
+static const char* malloc_symbol = "malloc";
+static const char* free_symbol = "free";
+static const char* realloc_symbol = "realloc";
+static const char* calloc_symbol = "calloc";
+static const char* posix_memalign_symbol = "posix_memalign";
+static const char* aligned_alloc_symbol = "aligned_alloc";
+static const char* memalign_symbol = "memalign";
+static const char* cfree_symbol = "cfree";
+
 static FILE* mallstream = 0;
 
 #define SMTLOG(...) printf(__VA_ARGS__)
+
+static void getProcessName(pid_t pid, char* processName);
+static size_t detectmemoryleak();
+
+
+// simplemtrace_init will be called before main()
+static int simplemalloctrace_initialize() __attribute__((constructor));
+
+static int simplemalloctrace_initialize()
+{
+    char logpath[1024] = {'\0', };
+    char processName[1024] = {'\0', };
+    pid_t pid = getpid();
+
+    if (mallstream)
+        return 0;
+
+    use_origin_malloc = 1;
+
+    getProcessName(pid, processName);
+    snprintf(logpath, sizeof(logpath), "%s.%d.malloctrace", processName, pid);
+    mallstream = fopen(logpath, "w");
+    if (!mallstream) {
+        SMTLOG("*** can't open mall file[%s]\n", logpath);
+        exit(1);
+        return 1;
+    }
+
+    use_origin_malloc = 0;
+
+    return 0;
+}
+
+// simplemtrace_finalize will be called after main()
+static int simplemalloctrace_finalize() __attribute__((destructor));
+
+static int simplemalloctrace_finalize()
+{
+#define COLOR_NONE "\033[0;0m"
+#define COLOR_RED "\033[5;31m"
+#define COLOR_GREEN "\033[0;42m"
+#define COLOR_YELLOW "\033[0;33m"
+    size_t memoryleaked = 0;
+
+    if (!mallstream)
+        return 0;
+
+    SMTLOG(COLOR_YELLOW"exit main function, let's check memory leak\n");
+    use_origin_malloc = 1;
+    if (mallstream) {
+        memoryleaked = detectmemoryleak();
+        fclose(mallstream);
+        mallstream = 0;
+    }
+    
+    if (memoryleaked) {
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
+        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+    } else
+        SMTLOG(COLOR_GREEN"GOOD PROGRAM, NO MEMORY LEAK\n");
+    SMTLOG(COLOR_NONE"\n");
+
+    return 0;
+}
 
 static void getProcessName(pid_t pid, char* processName)
 {
@@ -41,113 +130,6 @@ static void getProcessName(pid_t pid, char* processName)
     if (fgets(buf, sizeof(buf)-1, fp))
         sscanf(buf, "%*s %s", processName);
     fclose(fp);
-}
-
-// simplemtrace_init will be called before main()
-static int simplemtrace_initialize() __attribute__((constructor));
-
-static int simplemtrace_initialize()
-{
-    const char *err;
-    const char* malloc_symbol = "malloc";
-    const char* free_symbol = "free";
-    const char* realloc_symbol = "realloc";
-    const char* calloc_symbol = "calloc";
-    const char* posix_memalign_symbol = "posix_memalign";
-    const char* aligned_alloc_symbol = "aligned_alloc";
-    const char* memalign_symbol = "memalign";
-
-    char logpath[1024] = {'\0', };
-    char processName[1024] = {'\0', };
-    pid_t pid = getpid();
-
-    if (mallstream)
-        return 0;
-
-    use_origin_malloc = 1;
-    
-    libc_malloc = (void *(*)(size_t))dlsym(RTLD_NEXT, malloc_symbol);
-    if ((err = dlerror()))
-    {
-        SMTLOG("*** wrapper does not find `");
-        SMTLOG("%s", malloc_symbol);
-        SMTLOG("' in `libc.so'!\n");
-        exit(1);
-        return 1;
-    }
-    
-    libc_free = (void (*)(void *))dlsym(RTLD_NEXT, free_symbol);
-    if ((err = dlerror()))
-    {
-        SMTLOG("*** wrapper does not find `");
-        SMTLOG("%s", free_symbol);
-        SMTLOG("' in `libc.so'!\n");
-        exit(1);
-        return 1;
-    }
-
-    libc_realloc = (void*(*)(void*, size_t))dlsym(RTLD_NEXT, realloc_symbol);
-    if ((err = dlerror()))
-    {
-        SMTLOG("*** wrapper does not find `");
-        SMTLOG("%s", realloc_symbol);
-        SMTLOG("' in `libc.so'!\n");
-        exit(1);
-        return 1;
-    }
-
-    libc_calloc = (void*(*)(size_t, size_t))dlsym(RTLD_NEXT, calloc_symbol);
-    if ((err = dlerror()))
-    {
-        SMTLOG("*** wrapper does not find `");
-        SMTLOG("%s", calloc_symbol);
-        SMTLOG("' in `libc.so'!\n");
-        exit(1);
-        return 1;
-    }
-
-    libc_posix_memalign = (int (*)(void**, size_t, size_t))dlsym(RTLD_NEXT, posix_memalign_symbol);
-    if ((err = dlerror()))
-    {
-        SMTLOG("*** wrapper does not find `");
-        SMTLOG("%s", posix_memalign_symbol);
-        SMTLOG("' in `libc.so'!\n");
-        exit(1);
-        return 1;
-    }
-
-    libc_aligned_alloc = (void*(*)(size_t, size_t))dlsym(RTLD_NEXT, aligned_alloc_symbol);
-    if ((err = dlerror()))
-    {
-        SMTLOG("*** wrapper does not find `");
-        SMTLOG("%s", aligned_alloc_symbol);
-        SMTLOG("' in `libc.so'!\n");
-        exit(1);
-        return 1;
-    }
-
-    libc_memalign = (void*(*)(size_t, size_t))dlsym(RTLD_NEXT, memalign_symbol);
-    if ((err = dlerror()))
-    {
-        SMTLOG("*** wrapper does not find `");
-        SMTLOG("%s", memalign_symbol);
-        SMTLOG("' in `libc.so'!\n");
-        exit(1);
-        return 1;
-    }
-
-    getProcessName(pid, processName);
-    snprintf(logpath, sizeof(logpath), "%s.%d.malloctrace", processName, pid);
-    mallstream = fopen(logpath, "w+");
-    if (!mallstream) {
-        SMTLOG("*** can't open mall file[%s]\n", logpath);
-        exit(1);
-        return 1;
-    }
-
-    use_origin_malloc = 0;
-
-    return 0;
 }
 
 #define BTSZ 10
@@ -250,7 +232,7 @@ void freeSymbols(Symbol* head)
     }
 }
 
-static int detectmemoryleak()
+static size_t detectmemoryleak()
 {
     if (!mallstream)
         return 0;
@@ -329,7 +311,11 @@ void tr_where(char c, void* p, size_t sz)
 #define BTAL 20
     void* bt[BTSZ];
     int btc, i;
-    char btstr[BTSZ*BTAL];
+    static char btstr[BTSZ*BTAL];
+
+    if (!mallstream)
+        return;
+
     memset(btstr, ' ', BTSZ*BTAL);
 
     sprintf(btstr, "%c %p %zx ", c, p, sz);
@@ -346,71 +332,20 @@ void tr_where(char c, void* p, size_t sz)
                 btstr[i] = ' ';
         }
     }
-    fprintf(mallstream, "%s \n", btstr);
-}
-
-// memory pool for malloc/ccalloc before simpletrace initialized
-static char memorypool[1024*1024];
-static int pool_index = 0;
-static void* poolmax = (void*)(memorypool + 1024*1024);
-
-void* mfp_memalign(size_t alignment, size_t size)
-{
-    if ((alignment == 0) || (alignment & (alignment - 1)))
-        return 0;
-
-    void* ptr = 0;
-    while (1) {
-        ptr = memorypool + pool_index;
-        if (ptr >= poolmax)
-            return 0;
-        if (((size_t) ptr & (alignment - 1)) == (size_t) ptr)
-            break;
-        pool_index++;
-    }
     
-    if (size % 8)
-        size += size % 8;
-    pool_index += size;
-
-    return ptr;
-}
-
-int mfp_p_align(void** memptr, size_t alignment, size_t size)
-{
-    void* r = mfp_memalign(alignment, size);
-    if (r) {
-        *memptr = r;
-        return 0;
-    }
-    return -1;
-}
-
-void* mfp_align(size_t alignment, size_t size)
-{
-    size = size + alignment - (size % alignment);
-    return mfp_memalign(alignment, size);
-}
-
-void* mfp(size_t sz)
-{
-    if (sz % 8) {
-        sz += sz % 8;
-    }
-    if ((memorypool + pool_index + sz) >= poolmax) {
-        SMTLOG("memory pool is not enough\n");
-        return 0;
-    }
-    void* r = (void*)(memorypool + pool_index);
-    pool_index += sz;
-    return r;
+    fprintf(mallstream, "%s \n", btstr);
 }
 
 void* malloc(size_t sz)
 {
     void* r = 0;
     if (!libc_malloc) {
-        return mfp(sz);
+        libc_malloc = (MALLOC_FUNCTION)dlsym(RTLD_NEXT, malloc_symbol);
+        if (!libc_malloc) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", malloc_symbol);
+            exit(1);
+            return 0;
+        }
     }
     r = libc_malloc(sz);
     if (!use_origin_malloc && r) {
@@ -423,7 +358,12 @@ void* realloc(void* p, size_t sz)
 {
     void* r = 0;
     if (!libc_realloc) {
-        return mfp(sz);
+        libc_realloc = (REALLOC_FUNCTION)dlsym(RTLD_NEXT, realloc_symbol);
+        if (!libc_realloc) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", realloc_symbol);
+            exit(1);
+            return 0;
+        }
     }
     r = libc_realloc(p, sz);
     if (!use_origin_malloc && r && r != p) {
@@ -432,11 +372,42 @@ void* realloc(void* p, size_t sz)
     return r;
 }
 
+static void* static_alloc(size_t size)
+{
+    static char memory_pool[1024] = {0, };
+    static size_t pool_index = 0;
+
+    void* r = 0;
+    if (size % 8)
+        size += size % 8;
+
+    if (pool_index >= 1024) {
+        SMTLOG("*** memory pool is not enough\n");
+        return 0;
+    }
+
+    r = memory_pool + pool_index + sizeof(size_t) + 2;
+    *((size_t*)(memory_pool + pool_index)) = size;
+    *(memory_pool + pool_index + sizeof(size_t) + 1) = '+';
+
+    return r;
+}
+
 void* calloc(size_t nitems, size_t size)
 {
     void* r = 0;
     if (!libc_calloc) {
-        return mfp(nitems*size);
+        if (malloc_for_dlsym) {
+            return static_alloc(nitems*size);
+        }
+        malloc_for_dlsym = 1;
+        libc_calloc = (CALLOC_FUNCTION)dlsym(RTLD_NEXT, calloc_symbol);
+        malloc_for_dlsym = 0;
+        if (!libc_calloc) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", calloc_symbol);
+            exit(1);
+            return 0;
+        }
     }
     r = libc_calloc(nitems, size);
     if (!use_origin_malloc && r) {
@@ -449,7 +420,12 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
 {
     int r;
     if (!libc_posix_memalign) {
-        return mfp_p_align(memptr, alignment, size);
+        libc_posix_memalign = (POSIX_MEMALIGN_FUNCTION)dlsym(RTLD_NEXT, posix_memalign_symbol);
+        if (!libc_posix_memalign) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", posix_memalign_symbol);
+            exit(1);
+            return -1;
+        }
     }
     r = libc_posix_memalign(memptr, alignment, size);
     if (!use_origin_malloc && *memptr) {
@@ -462,7 +438,12 @@ void *aligned_alloc(size_t alignment, size_t size)
 {
     void* r = 0;
     if (!libc_aligned_alloc) {
-        return mfp_align(alignment, size);
+        libc_aligned_alloc = (ALIGNED_ALLOC_FUNCTION)dlsym(RTLD_NEXT, aligned_alloc_symbol);
+        if (!libc_aligned_alloc) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", aligned_alloc_symbol);
+            exit(1);
+            return 0;
+        }
     }
     r = libc_aligned_alloc(alignment, size);
     if (!use_origin_malloc && r) {
@@ -475,7 +456,12 @@ void *memalign(size_t alignment, size_t size)
 {
     void* r = 0;
     if (!libc_memalign) {
-        return mfp_memalign(alignment, size);
+        libc_memalign = (MEMALIGN_FUNCTION)dlsym(RTLD_NEXT, memalign_symbol);
+        if (!libc_memalign) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", memalign_symbol);
+            exit(1);
+            return 0;
+        }
     }
     r = libc_memalign(alignment, size);
     if (!use_origin_malloc && r) {
@@ -487,50 +473,37 @@ void *memalign(size_t alignment, size_t size)
 void free(void* p)
 {
     if (p) {
-        if (p >= memorypool && p < poolmax) {
-            return;
+        if (!libc_free) {
+            libc_free = (FREE_FUNCTION)dlsym(RTLD_NEXT, free_symbol);
+            if (!libc_free) {
+                SMTLOG("*** wrapper does not find [%s] in libc.so\n", free_symbol);
+                exit(1);
+                return;
+            }
         }
+        libc_free(p);
         if (!use_origin_malloc) {
             tr_where('-', p, 0);
         }
-        libc_free(p);
     }
 }
 
-// simplemtrace_finalize will be called after main()
-static int simplemtrace_finalize() __attribute__((destructor));
-
-static int simplemtrace_finalize()
+void cfree(void* p)
 {
-#define COLOR_NONE "\033[0;0m"
-#define COLOR_RED "\033[5;31m"
-#define COLOR_GREEN "\033[0;42m"
-#define COLOR_YELLOW "\033[0;33m"
-    size_t memoryleaked = 0;
-
-    if (!mallstream)
-        return 0;
-
-    SMTLOG(COLOR_YELLOW"exit main function, let's check memory leak\n");
-    use_origin_malloc = 1;
-    if (mallstream) {
-        memoryleaked = detectmemoryleak();
-        fclose(mallstream);
-        mallstream = 0;
+    if (p) {
+        if (!libc_cfree) {
+            libc_cfree = (CFREE_FUNCTION)dlsym(RTLD_NEXT, cfree_symbol);
+            if (!libc_cfree) {
+                SMTLOG("*** wrapper does not find [%s] in libc.so\n", cfree_symbol);
+                exit(1);
+                return;
+            }
+        }
+        libc_cfree(p);
+        if (!use_origin_malloc) {
+            tr_where('-', p, 0);
+        }
     }
-    
-    if (memoryleaked) {
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
-        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-    } else
-        SMTLOG(COLOR_GREEN"GOOD PROGRAM, NO MEMORY LEAK\n");
-    SMTLOG(COLOR_NONE"\n");
-
-    return 0;
 }
 
 }
