@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <execinfo.h>
 #include <pthread.h>
+#include <errno.h>
 
 #include "Symbolize.h"
 
@@ -34,7 +35,7 @@ static __thread MEMALIGN_FUNCTION libc_memalign = 0;
 static __thread ALIGNED_ALLOC_FUNCTION libc_aligned_alloc = 0;
 static __thread POSIX_MEMALIGN_FUNCTION libc_posix_memalign = 0;
 
-static __thread int use_origin_malloc = 1;
+static __thread int use_origin_malloc = 0;
 static __thread int malloc_for_dlsym = 0;
 
 static const char* malloc_symbol = "malloc";
@@ -47,6 +48,7 @@ static const char* memalign_symbol = "memalign";
 static const char* cfree_symbol = "cfree";
 
 static FILE* mallstream = 0;
+static char logpath[1024] = {'\0', };
 
 #define SMTLOG(...) printf(__VA_ARGS__)
 
@@ -59,7 +61,6 @@ static int simplemalloctrace_initialize() __attribute__((constructor));
 
 static int simplemalloctrace_initialize()
 {
-    char logpath[1024] = {'\0', };
     char processName[1024] = {'\0', };
     pid_t pid = getpid();
 
@@ -98,6 +99,8 @@ static int simplemalloctrace_finalize()
 
     SMTLOG(COLOR_YELLOW"exit main function, let's check memory leak\n");
     use_origin_malloc = 1;
+    fclose(mallstream);
+    mallstream = fopen(logpath, "r");
     if (mallstream) {
         memoryleaked = detectmemoryleak();
         fclose(mallstream);
@@ -242,7 +245,6 @@ static size_t detectmemoryleak()
     int index = 0;
     Symbol* sl = 0;
 
-    fflush(mallstream);
     fseek(mallstream, 0, SEEK_SET);
     
     size_t n = 0;
@@ -311,7 +313,7 @@ void tr_where(char c, void* p, size_t sz)
 #define BTAL 20
     void* bt[BTSZ];
     int btc, i;
-    static char btstr[BTSZ*BTAL];
+    char btstr[BTSZ*BTAL];
 
     if (!mallstream)
         return;
@@ -332,7 +334,7 @@ void tr_where(char c, void* p, size_t sz)
                 btstr[i] = ' ';
         }
     }
-    
+
     fprintf(mallstream, "%s \n", btstr);
 }
 
