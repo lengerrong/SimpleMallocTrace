@@ -3,6 +3,7 @@ project(SimpleMallocTrace)
 
 SET (SOURCE
     smtest.cpp
+    AddressMap.h
     SimpleMallocTrace.cpp
     Symbolize.h
     Symbolize.cpp
