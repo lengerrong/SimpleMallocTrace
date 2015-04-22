@@ -14,6 +14,7 @@
 
 #include "Symbolize.h"
 #include "AddressMap.h"
+#include "semaphore.h"
 
 extern "C" {
 
@@ -26,17 +27,17 @@ typedef void * (*MEMALIGN_FUNCTION) (size_t, size_t);
 typedef void * (*ALIGNED_ALLOC_FUNCTION) (size_t, size_t);
 typedef int (*POSIX_MEMALIGN_FUNCTION) (void**, size_t, size_t);
 
-static __thread MALLOC_FUNCTION libc_malloc = 0;
-static __thread CALLOC_FUNCTION libc_calloc = 0;
-static __thread REALLOC_FUNCTION libc_realloc = 0;
-static __thread FREE_FUNCTION libc_free = 0;
-static __thread CFREE_FUNCTION libc_cfree = 0;
-static __thread MEMALIGN_FUNCTION libc_memalign = 0;
-static __thread ALIGNED_ALLOC_FUNCTION libc_aligned_alloc = 0;
-static __thread POSIX_MEMALIGN_FUNCTION libc_posix_memalign = 0;
+static  MALLOC_FUNCTION libc_malloc = 0;
+static  CALLOC_FUNCTION libc_calloc = 0;
+static  REALLOC_FUNCTION libc_realloc = 0;
+static  FREE_FUNCTION libc_free = 0;
+static  CFREE_FUNCTION libc_cfree = 0;
+static  MEMALIGN_FUNCTION libc_memalign = 0;
+static  ALIGNED_ALLOC_FUNCTION libc_aligned_alloc = 0;
+static  POSIX_MEMALIGN_FUNCTION libc_posix_memalign = 0;
 
 static __thread int use_origin_malloc = 0;
-static __thread int malloc_for_dlsym = 0;
+static __thread int calloc_for_dlsym = 0;
 
 static const char* malloc_symbol = "malloc";
 static const char* free_symbol = "free";
@@ -47,37 +48,121 @@ static const char* aligned_alloc_symbol = "aligned_alloc";
 static const char* memalign_symbol = "memalign";
 static const char* cfree_symbol = "cfree";
 
-pthread_mutex_t lock;
-AddressMap* smtmap = 0;
+pthread_mutex_t maplock;
+static AddressMap* smtmap = 0;
+static sem_t smtinit_sem;
 
 #define SMTLOG(...) printf(__VA_ARGS__)
 
 static size_t detectmemoryleak();
 
-// simplemtrace_init will be called before main()
+// simplemalloctrace_initialize will be called before main()
 static int simplemalloctrace_initialize() __attribute__((constructor));
+
+static void malloc_hook()
+{
+    static int simplemalloctrace_init_begined = 0;
+    int r = 0;
+
+    if (simplemalloctrace_init_begined) {
+        SMTLOG("malloc hook init begined, let's wait for semaphore\n");
+        sem_wait(&smtinit_sem);
+        return;
+    }
+    
+    SMTLOG("malloc hook begin\n");
+
+    simplemalloctrace_init_begined = 1;
+
+    calloc_for_dlsym = 1;
+    do {
+        libc_malloc = (MALLOC_FUNCTION)dlsym(RTLD_NEXT, malloc_symbol);
+        if (!libc_malloc) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", malloc_symbol);
+            r = 1;
+            break;
+        }
+        libc_realloc = (REALLOC_FUNCTION)dlsym(RTLD_NEXT, realloc_symbol);
+        if (!libc_realloc) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", realloc_symbol);
+            r = 1;
+            break;
+        }
+        libc_calloc = (CALLOC_FUNCTION)dlsym(RTLD_NEXT, calloc_symbol);
+        if (!libc_calloc) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", calloc_symbol);
+            r = 1;
+            break;
+        }
+        libc_posix_memalign = (POSIX_MEMALIGN_FUNCTION)dlsym(RTLD_NEXT, posix_memalign_symbol);
+        if (!libc_posix_memalign) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", posix_memalign_symbol);
+            r = 1;
+            break;
+        }
+        libc_aligned_alloc = (ALIGNED_ALLOC_FUNCTION)dlsym(RTLD_NEXT, aligned_alloc_symbol);
+        if (!libc_aligned_alloc) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", aligned_alloc_symbol);
+            r = 1;
+            break;
+        }
+        libc_memalign = (MEMALIGN_FUNCTION)dlsym(RTLD_NEXT, memalign_symbol);
+        if (!libc_memalign) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", memalign_symbol);
+            r = 1;
+            break;
+        }
+        libc_free = (FREE_FUNCTION)dlsym(RTLD_NEXT, free_symbol);
+        if (!libc_free) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", free_symbol);
+            r = 1;
+            break;
+        }
+        libc_cfree = (CFREE_FUNCTION)dlsym(RTLD_NEXT, cfree_symbol);
+        if (!libc_cfree) {
+            SMTLOG("*** wrapper does not find [%s] in libc.so\n", cfree_symbol);
+            r = 1;
+            break;
+        }
+
+        if (sem_init(&smtinit_sem, 0, 0)) {
+            SMTLOG("*** semaphore init failed\n");
+            r = 1;
+            break;
+        }
+
+        r = 0;
+    } while(0);
+    calloc_for_dlsym = 0;
+
+    if (r)
+        exit(1);
+    
+    use_origin_malloc = 1;
+    smtmap = new AddressMap;
+    if (!smtmap) {
+        SMTLOG("new AddressMap failed\n");
+        exit(1);
+    }
+    use_origin_malloc = 0;
+
+    SMTLOG("malloc hook done, let's post the semaphore\n");
+    sem_post(&smtinit_sem);  
+}
 
 static int simplemalloctrace_initialize()
 {
-    use_origin_malloc = 1;
-    if (pthread_mutex_init(&lock, 0)) {
-        SMTLOG("*** init mutex failed\n");
+    malloc_hook();
+
+    if (pthread_mutex_init(&maplock, 0)) {
+        SMTLOG("Mutex init failed!\n");
         exit(1);
-        return 1;
     }
 
-    smtmap = new AddressMap;
-    if (!smtmap) {
-        SMTLOG("*** new AddressMap failed\n");
-        exit(1);
-        return 1;
-    }
-        
-    use_origin_malloc = 0;
     return 0;
 }
 
-// simplemtrace_finalize will be called after main()
+// simplemalloctrace_finalize will be called after main()
 static int simplemalloctrace_finalize() __attribute__((destructor));
 
 static int simplemalloctrace_finalize()
@@ -90,7 +175,8 @@ static int simplemalloctrace_finalize()
 
     SMTLOG(COLOR_YELLOW"exit main function, let's check memory leak\n");
 
-    pthread_mutex_destroy(&lock);
+    pthread_mutex_destroy(&maplock);
+
     use_origin_malloc = 1;
     if (smtmap) {
         memoryleaked = detectmemoryleak();
@@ -220,7 +306,7 @@ static size_t detectmemoryleak()
     Symbol* sl = 0;
 
     for (i = 0; i < sz; i++) {
-        SMTLOG("MEMORYLEAK[%ld]###########################################################################\n", i);
+        SMTLOG("MEMORYLEAK[%ld]###########################################################################\n", i+1);
         AddressInfo* ai = (*smtmap)[i];
         SMTLOG("leak memory [%p, %ld]", ai->addr, ai->sz);
         lc += ai->sz;
@@ -248,9 +334,9 @@ static size_t detectmemoryleak()
                     addSymbol(&sl, address, buf);
                 }
             }
-            SMTLOG("#%ld\t%p\t%s\t%s\n", i+1, ai->bt[i], objectpath, functionname ? functionname : "(null)");
+            SMTLOG("#%d\t%p\t%s\t%s\n", j+1, ai->bt[j], objectpath, functionname ? functionname : "(null)");
         }
-        SMTLOG("MEMORYLEAK[%ld]###########################################################################\n", i);
+        SMTLOG("MEMORYLEAK[%ld]###########################################################################\n", i+1);
     }
 
     freeSymbols(sl);
@@ -269,13 +355,13 @@ void tr_where(char c, void* p, size_t sz)
     use_origin_malloc = 1;
     if (c == '+') {
         backtrace(bt, BTSZ);
-        pthread_mutex_lock(&lock);
+        pthread_mutex_lock(&maplock);
         smtmap->append(p, sz, bt);
-        pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&maplock);
     } else {
-        pthread_mutex_lock(&lock);
+        pthread_mutex_lock(&maplock);
         smtmap->remove(p);
-        pthread_mutex_unlock(&lock);
+        pthread_mutex_unlock(&maplock);
     }
     use_origin_malloc = 0;
 }
@@ -284,12 +370,8 @@ void* malloc(size_t sz)
 {
     void* r = 0;
     if (!libc_malloc) {
-        libc_malloc = (MALLOC_FUNCTION)dlsym(RTLD_NEXT, malloc_symbol);
-        if (!libc_malloc) {
-            SMTLOG("*** wrapper does not find [%s] in libc.so\n", malloc_symbol);
-            exit(1);
-            return 0;
-        }
+        SMTLOG("wait for smtinit_sem %s %d\n", __FUNCTION__, __LINE__);
+        malloc_hook();
     }
     r = libc_malloc(sz);
     if (!use_origin_malloc && r) {
@@ -302,12 +384,8 @@ void* realloc(void* p, size_t sz)
 {
     void* r = 0;
     if (!libc_realloc) {
-        libc_realloc = (REALLOC_FUNCTION)dlsym(RTLD_NEXT, realloc_symbol);
-        if (!libc_realloc) {
-            SMTLOG("*** wrapper does not find [%s] in libc.so\n", realloc_symbol);
-            exit(1);
-            return 0;
-        }
+        SMTLOG("wait for smtinit_sem %s %d\n", __FUNCTION__, __LINE__);
+        malloc_hook();
     }
     r = libc_realloc(p, sz);
     if (!use_origin_malloc && r && r != p) {
@@ -316,7 +394,7 @@ void* realloc(void* p, size_t sz)
     return r;
 }
 
-static void* static_alloc(size_t size)
+static void* static_calloc(size_t size)
 {
     static char memory_pool[1024] = {0, };
     static size_t pool_index = 0;
@@ -341,17 +419,10 @@ void* calloc(size_t nitems, size_t size)
 {
     void* r = 0;
     if (!libc_calloc) {
-        if (malloc_for_dlsym) {
-            return static_alloc(nitems*size);
-        }
-        malloc_for_dlsym = 1;
-        libc_calloc = (CALLOC_FUNCTION)dlsym(RTLD_NEXT, calloc_symbol);
-        malloc_for_dlsym = 0;
-        if (!libc_calloc) {
-            SMTLOG("*** wrapper does not find [%s] in libc.so\n", calloc_symbol);
-            exit(1);
-            return 0;
-        }
+        if (calloc_for_dlsym)
+            return static_calloc(nitems*size);
+        SMTLOG("wait for smtinit_sem %s %d\n", __FUNCTION__, __LINE__);
+        malloc_hook();
     }
     r = libc_calloc(nitems, size);
     if (!use_origin_malloc && r) {
@@ -364,12 +435,8 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
 {
     int r;
     if (!libc_posix_memalign) {
-        libc_posix_memalign = (POSIX_MEMALIGN_FUNCTION)dlsym(RTLD_NEXT, posix_memalign_symbol);
-        if (!libc_posix_memalign) {
-            SMTLOG("*** wrapper does not find [%s] in libc.so\n", posix_memalign_symbol);
-            exit(1);
-            return -1;
-        }
+        SMTLOG("wait for smtinit_sem %s %d\n", __FUNCTION__, __LINE__);
+        malloc_hook();
     }
     r = libc_posix_memalign(memptr, alignment, size);
     if (!use_origin_malloc && *memptr) {
@@ -382,12 +449,8 @@ void *aligned_alloc(size_t alignment, size_t size)
 {
     void* r = 0;
     if (!libc_aligned_alloc) {
-        libc_aligned_alloc = (ALIGNED_ALLOC_FUNCTION)dlsym(RTLD_NEXT, aligned_alloc_symbol);
-        if (!libc_aligned_alloc) {
-            SMTLOG("*** wrapper does not find [%s] in libc.so\n", aligned_alloc_symbol);
-            exit(1);
-            return 0;
-        }
+        SMTLOG("wait for smtinit_sem %s %d\n", __FUNCTION__, __LINE__);
+        malloc_hook();
     }
     r = libc_aligned_alloc(alignment, size);
     if (!use_origin_malloc && r) {
@@ -400,12 +463,9 @@ void *memalign(size_t alignment, size_t size)
 {
     void* r = 0;
     if (!libc_memalign) {
-        libc_memalign = (MEMALIGN_FUNCTION)dlsym(RTLD_NEXT, memalign_symbol);
-        if (!libc_memalign) {
-            SMTLOG("*** wrapper does not find [%s] in libc.so\n", memalign_symbol);
-            exit(1);
-            return 0;
-        }
+        SMTLOG("wait for smtinit_sem %s %d\n", __FUNCTION__, __LINE__);
+        malloc_hook();
+        sem_wait(&smtinit_sem);
     }
     r = libc_memalign(alignment, size);
     if (!use_origin_malloc && r) {
@@ -418,12 +478,8 @@ void free(void* p)
 {
     if (p) {
         if (!libc_free) {
-            libc_free = (FREE_FUNCTION)dlsym(RTLD_NEXT, free_symbol);
-            if (!libc_free) {
-                SMTLOG("*** wrapper does not find [%s] in libc.so\n", free_symbol);
-                exit(1);
-                return;
-            }
+            SMTLOG("wait for smtinit_sem %s %d\n", __FUNCTION__, __LINE__);
+            malloc_hook();
         }
         libc_free(p);
         if (!use_origin_malloc) {
@@ -436,12 +492,8 @@ void cfree(void* p)
 {
     if (p) {
         if (!libc_cfree) {
-            libc_cfree = (CFREE_FUNCTION)dlsym(RTLD_NEXT, cfree_symbol);
-            if (!libc_cfree) {
-                SMTLOG("*** wrapper does not find [%s] in libc.so\n", cfree_symbol);
-                exit(1);
-                return;
-            }
+            SMTLOG("wait for smtinit_sem %s %d\n", __FUNCTION__, __LINE__);
+            malloc_hook();
         }
         libc_cfree(p);
         if (!use_origin_malloc) {
