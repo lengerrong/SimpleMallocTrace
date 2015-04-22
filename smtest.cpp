@@ -46,6 +46,26 @@ thread_start(void *arg)
     return uargv;
 }
 
+class A {
+public:
+    A() {
+        a = malloc(10);
+        b = calloc(20, 100);
+    }
+    ~A() {
+        if (a)
+            free(a);
+        if (b)
+            free(b);
+    }
+
+private:
+    void* a;
+    void* b;
+};
+
+static A a;
+
 int
 main(int argc, char *argv[])
 {
