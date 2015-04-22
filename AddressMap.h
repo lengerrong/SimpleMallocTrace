@@ -85,6 +85,8 @@ public:
     {
         int index;
         if (hasAddr(addr, 0, _size - 1, &index)) {
+            AddressInfo* ai = _map[index];
+            delete ai;
             for (size_t i = index; i < _size - 1; i++)
                 _map[i] = _map[i+1];
             _size--;
