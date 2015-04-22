@@ -137,6 +137,9 @@ static void malloc_hook()
 
     if (r)
         exit(1);
+
+    SMTLOG("malloc hook done, let's post the semaphore\n");
+    sem_post(&smtinit_sem);
     
     use_origin_malloc = 1;
     smtmap = new AddressMap;
@@ -145,9 +148,6 @@ static void malloc_hook()
         exit(1);
     }
     use_origin_malloc = 0;
-
-    SMTLOG("malloc hook done, let's post the semaphore\n");
-    sem_post(&smtinit_sem);  
 }
 
 static int simplemalloctrace_initialize()
