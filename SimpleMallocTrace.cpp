@@ -59,6 +59,34 @@ static size_t detectmemoryleak();
 // simplemalloctrace_initialize will be called before main()
 static int simplemalloctrace_initialize() __attribute__((constructor));
 
+static int __attribute__((constructor)) backtrace_init()
+{
+    // avoid dead lock in backtrace()
+    // #0 0x424a84b8 in __lll_lock_wait () from /lib/libpthread.so.0
+    // No symbol table info available.
+    // #1 0x424a1a30 in pthread_mutex_lock () from /lib/libpthread.so.0
+    // No symbol table info available.
+    // #2 0x41013840 in _dl_open () from /lib/ld-linux.so.3
+    // No symbol table info available.
+    // #3 0x4224e890 in do_dlopen () from /lib/libc.so.6
+    // No symbol table info available.
+    // #4 0x4100fb60 in _dl_catch_error () from /lib/ld-linux.so.3
+    // No symbol table info available.
+    // #5 0x4224e970 in dlerror_run () from /lib/libc.so.6
+    // No symbol table info available.
+    // #6 0x4224e9f0 in __libc_dlopen_mode () from /lib/libc.so.6
+    // No symbol table info available.
+    // #7 0x42227bd0 in init () from /lib/libc.so.6
+    // No symbol table info available.
+    // #8 0x424a69c4 in pthread_once () from /lib/libpthread.so.0
+    // No symbol table info available.
+    // #9 0x42227ce0 in backtrace () from /lib/libc.so.6
+    // No symbol table info available.
+    // #10 0xb551a47a in tr_where (c=43 '+', sz=4, p=0x9c840) at 
+    void* buffer[1];
+    backtrace(buffer, 1);
+}
+
 static void malloc_hook()
 {
     static int simplemalloctrace_init_begined = 0;
@@ -67,6 +95,7 @@ static void malloc_hook()
     if (simplemalloctrace_init_begined) {
         SMTLOG("malloc hook init begined, let's wait for semaphore\n");
         sem_wait(&smtinit_sem);
+        SMTLOG("wait semaphore done!\n");
         return;
     }
     
