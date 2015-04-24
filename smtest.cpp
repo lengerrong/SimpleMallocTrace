@@ -37,7 +37,7 @@ thread_start(void *arg)
     for (p = uargv; *p != '\0'; p++)
         *p = toupper(*p);
 
-    {
+    for (int i = 0; i < 102400; i++) {
         int* a = (int*)malloc(10);
         int* b = (int*)realloc((void*)a, 20);
         int* c = (int*)calloc(10, 100);

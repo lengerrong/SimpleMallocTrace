@@ -4,19 +4,33 @@
 
 #include <cxxabi.h>
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <map>
+#include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <execinfo.h>
-#include <pthread.h>
 
 #include "Symbolize.h"
-#include "AddressMap.h"
-#include "semaphore.h"
+
+using namespace std;
+using std::map;
+using std::string;
 
 extern "C" {
+
+#define PATH_MAX 256
+#define BTSZ 10
+#define BTAL 20
+#define COLOR_NONE "\033[0;0m"
+#define COLOR_RED "\033[5;31m"
+#define COLOR_GREEN "\033[0;42m"
+#define COLOR_YELLOW "\033[0;33m"
+#define SMTLOG(...) printf(__VA_ARGS__)
 
 typedef void * (*MALLOC_FUNCTION) (size_t);
 typedef void * (*CALLOC_FUNCTION) (size_t, size_t);
@@ -49,42 +63,89 @@ static const char* memalign_symbol = "memalign";
 static const char* cfree_symbol = "cfree";
 
 pthread_mutex_t maplock;
-static AddressMap* smtmap = 0;
+class MallocNode {
+public:
+    MallocNode()
+        : sz(0)
+    {
+    }
+    MallocNode(size_t _sz, void* _bt[])
+        : sz(_sz)
+    {
+        memcpy(bt, _bt, sizeof(bt));
+    }
+public:
+    size_t sz;
+    void* bt[BTSZ];
+};
+static std::map<void*, MallocNode>* mmap = 0;
 static sem_t smtinit_sem;
 
-#define SMTLOG(...) printf(__VA_ARGS__)
-
 static size_t detectmemoryleak();
+static char* getlogpath();
+static void malloc_hook();
 
 // simplemalloctrace_initialize will be called before main()
-static int simplemalloctrace_initialize() __attribute__((constructor));
+static void __attribute__((constructor)) simplemalloctrace_initialize()
+{
+    malloc_hook();
+    if (pthread_mutex_init(&maplock, 0)) {
+        SMTLOG("Mutex init failed!\n");
+        exit(1);
+    }
+}
 
+// avoid dead lock in backtrace()
+// #0 0x424a84b8 in __lll_lock_wait () from /lib/libpthread.so.0
+// No symbol table info available.
+// #1 0x424a1a30 in pthread_mutex_lock () from /lib/libpthread.so.0
+// No symbol table info available.
+// #2 0x41013840 in _dl_open () from /lib/ld-linux.so.3
+// No symbol table info available.
+// #3 0x4224e890 in do_dlopen () from /lib/libc.so.6
+// No symbol table info available.
+// #4 0x4100fb60 in _dl_catch_error () from /lib/ld-linux.so.3
+// No symbol table info available.
+// #5 0x4224e970 in dlerror_run () from /lib/libc.so.6
+// No symbol table info available.
+// #6 0x4224e9f0 in __libc_dlopen_mode () from /lib/libc.so.6
+// No symbol table info available.
+// #7 0x42227bd0 in init () from /lib/libc.so.6
+// No symbol table info available.
+// #8 0x424a69c4 in pthread_once () from /lib/libpthread.so.0
+// No symbol table info available.
+// #9 0x42227ce0 in backtrace () from /lib/libc.so.6
+// No symbol table info available.
+// #10 0xb551a47a in tr_where (c=43 '+', sz=4, p=0x9c840) at 
 static int __attribute__((constructor)) backtrace_init()
 {
-    // avoid dead lock in backtrace()
-    // #0 0x424a84b8 in __lll_lock_wait () from /lib/libpthread.so.0
-    // No symbol table info available.
-    // #1 0x424a1a30 in pthread_mutex_lock () from /lib/libpthread.so.0
-    // No symbol table info available.
-    // #2 0x41013840 in _dl_open () from /lib/ld-linux.so.3
-    // No symbol table info available.
-    // #3 0x4224e890 in do_dlopen () from /lib/libc.so.6
-    // No symbol table info available.
-    // #4 0x4100fb60 in _dl_catch_error () from /lib/ld-linux.so.3
-    // No symbol table info available.
-    // #5 0x4224e970 in dlerror_run () from /lib/libc.so.6
-    // No symbol table info available.
-    // #6 0x4224e9f0 in __libc_dlopen_mode () from /lib/libc.so.6
-    // No symbol table info available.
-    // #7 0x42227bd0 in init () from /lib/libc.so.6
-    // No symbol table info available.
-    // #8 0x424a69c4 in pthread_once () from /lib/libpthread.so.0
-    // No symbol table info available.
-    // #9 0x42227ce0 in backtrace () from /lib/libc.so.6
-    // No symbol table info available.
-    // #10 0xb551a47a in tr_where (c=43 '+', sz=4, p=0x9c840) at 
     void* buffer[1];
     backtrace(buffer, 1);
+}
+
+// simplemalloctrace_finalize will be called after main()
+static void __attribute__((destructor)) simplemalloctrace_finalize()
+{
+    size_t memoryleaked = 0;
+    SMTLOG(COLOR_YELLOW"exit main function, let's check memory leak\n");
+    pthread_mutex_destroy(&maplock);
+    use_origin_malloc = 1;
+    if (mmap) {
+        memoryleaked = detectmemoryleak();
+        delete mmap;
+        mmap = 0;
+    }
+    if (memoryleaked) {
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
+        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
+        SMTLOG(COLOR_RED"please check [%s] for more detail\n", getlogpath());
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+    } else
+        SMTLOG(COLOR_GREEN"GOOD PROGRAM, NO MEMORY LEAK\n");
+    SMTLOG(COLOR_NONE"\n");
 }
 
 static void malloc_hook()
@@ -171,225 +232,105 @@ static void malloc_hook()
     sem_post(&smtinit_sem);
     
     use_origin_malloc = 1;
-    smtmap = new AddressMap;
-    if (!smtmap) {
+    mmap = new std::map<void*, MallocNode>();
+    if (!mmap) {
         SMTLOG("new AddressMap failed\n");
         exit(1);
     }
     use_origin_malloc = 0;
 }
 
-static int simplemalloctrace_initialize()
+static char* getlogpath()
 {
-    malloc_hook();
-
-    if (pthread_mutex_init(&maplock, 0)) {
-        SMTLOG("Mutex init failed!\n");
-        exit(1);
-    }
-
-    return 0;
-}
-
-// simplemalloctrace_finalize will be called after main()
-static int simplemalloctrace_finalize() __attribute__((destructor));
-
-static int simplemalloctrace_finalize()
-{
-#define COLOR_NONE "\033[0;0m"
-#define COLOR_RED "\033[5;31m"
-#define COLOR_GREEN "\033[0;42m"
-#define COLOR_YELLOW "\033[0;33m"
-    size_t memoryleaked = 0;
-
-    SMTLOG(COLOR_YELLOW"exit main function, let's check memory leak\n");
-
-    pthread_mutex_destroy(&maplock);
-
-    use_origin_malloc = 1;
-    if (smtmap) {
-        memoryleaked = detectmemoryleak();
-        delete smtmap;
-        smtmap = 0;
-    }
-
-    if (memoryleaked) {
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
-        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-    } else
-        SMTLOG(COLOR_GREEN"GOOD PROGRAM, NO MEMORY LEAK\n");
-    SMTLOG(COLOR_NONE"\n");
-
-    return 0;
-}
-
-#define BTSZ 10
-#define BTAL 20
-
-typedef struct _mnode{
-    void* p;
-    size_t sz;
-    void* bt[BTSZ];
-    struct _mnode* next;
-}mnode;
-
-void addmnode(mnode** mlp, char* line)
-{
-    int i;
-    char* endptr;
-    mnode* mn = (mnode*)malloc(sizeof(mnode));
-    if (!mn) {
-        return;
-    }
-    memset(mn, 0x00, sizeof(mnode));
-
-    endptr = line+1;
-    mn->p = (void*)strtoll(endptr, &endptr, 16);
-    mn->sz = strtoll(endptr, &endptr, 16);
-    i = 0;
-    while ((mn->bt[i++] = (void*)strtoll(endptr, &endptr, 16)));
-
-    if (*mlp) {
-        mnode* t = *mlp;
-        while (t && t->next)
-            t = t->next;
-        t->next = mn;
-    } else
-        *mlp = mn;
-}
-
-void delmnode(mnode** mlp, char* line)
-{
-    void* p = (void*)strtoll(line+1, 0, 16);
-    mnode* ml = *mlp;
-    mnode* mp = 0;
-    while (ml) {
-        if (ml->p == p) {
-            if (mp) {
-                mp->next = ml->next;
-            } else {
-                *mlp = ml->next;
-            }
-            free(ml);
-            break;
+    static char logpath[PATH_MAX] = {0, };
+    if (!logpath[0]) {
+        char pp[PATH_MAX];
+        char buf[PATH_MAX];
+        FILE* fp = 0;
+        pid_t pid = getpid();
+        snprintf(pp, sizeof(pp), "/proc/%d/status", pid);
+        fp = fopen(pp, "r");
+        if (fp) {
+            if (fgets(buf, sizeof(buf)-1, fp))
+                sscanf(buf, "%*s %s", pp);
+            sprintf(logpath, "%s.%d.memoryleak", pp, pid);
+            fclose(fp);
         }
-        mp = ml;
-        ml = ml->next;
     }
-}
-
-typedef struct _Symbol {
-    void* address;
-    char symbol[1024];
-    struct _Symbol* next;
-} Symbol;
-
-char* findSymbol(Symbol* head, void* address)
-{
-    if (!head)
-        return 0;
-    while (head) {
-        if (head->address == address)
-            return head->symbol;
-        head = head->next;
-    }
-    return 0;
-}
-
-void addSymbol(Symbol** phead, void* address, char* symbol)
-{
-    Symbol* h = *phead;
-    Symbol* s = (Symbol*)malloc(sizeof(Symbol));
-    if (!s)
-        return;
-    s->address = address;
-    snprintf(s->symbol, sizeof(s->symbol), "%s", symbol);
-    s->next = 0;
-    if (h) {
-        while (h && h->next)
-            h = h->next;
-        h->next = s;
-    } else {
-        *phead = s;
-    }
-}
-
-void freeSymbols(Symbol* head)
-{
-    while (head) {
-        Symbol* s = head;
-        head = head->next;
-        free(s);
-    }
+    return logpath;
 }
 
 static size_t detectmemoryleak()
 {
     size_t lc = 0;
-    size_t i;
-    size_t sz = smtmap->size();
-    Symbol* sl = 0;
-
-    for (i = 0; i < sz; i++) {
-        SMTLOG("MEMORYLEAK[%ld]###########################################################################\n", i+1);
-        AddressInfo* ai = (*smtmap)[i];
-        SMTLOG("leak memory [%p, %ld]", ai->addr, ai->sz);
-        lc += ai->sz;
-        SMTLOG("back trace:\n");
+    size_t i = 0;
+    char buf[1024];
+    std::map<void*, std::string> smap;
+    std::map<void*, std::string>::iterator sit;
+    std::map<void*, MallocNode>::iterator it;
+    FILE* f = 0;
+    struct timespec before, after;
+    clock_gettime(CLOCK_REALTIME, &before);
+    if (!mmap->empty()) {
+        f = fopen(getlogpath(), "w");
+        if (!f) {
+            SMTLOG("*** Fail to open log file %s to write\n", getlogpath());
+            return 0;
+        }
+    }
+    for (it = mmap->begin(); it != mmap->end(); ++it) {
+        void* p = it->first;
+        size_t sz = it->second.sz;
+        void** bt = it->second.bt;
         int j;
+        i++;
+        fprintf(f, "MEMORYLEAK[%ld][%p, %ld] with BT:\n", i, p, sz);
         for (j = 0; j < BTSZ; j++) {
             Dl_info info;
             const char* cxaDemangled = 0;
             const char* objectpath = 0;
             const char* functionname = 0;
-            char buf[1024] = { '\0' };
-            if (!ai->bt[j])
+            if (!bt[j])
                 break;
-            dladdr(ai->bt[j], &info);
+            dladdr(bt[j], &info);
             objectpath = info.dli_fname ? info.dli_fname : "(nul)";
             cxaDemangled = info.dli_sname ? abi::__cxa_demangle(info.dli_sname, 0, 0, 0) : 0;
             functionname = cxaDemangled ? cxaDemangled : info.dli_sname ? info.dli_sname : 0;
+            if (!functionname)
+                if (sit = smap.find(p), sit != smap.end())
+                    functionname = sit->second.c_str();
             if (!functionname) {
-                functionname = findSymbol(sl, static_cast<char*>(ai->bt[j]) - 1);
-            }
-            if (!functionname) {
-                void* address = static_cast<char*>(ai->bt[j]) - 1;
+                void* address = static_cast<char*>(bt[j]) - 1;
                 if (WTF::Symbolize(address, buf, sizeof(buf))) {
                     functionname = buf;
-                    addSymbol(&sl, address, buf);
+                    smap.insert(std::pair<void*, std::string>(p, std::string(functionname)));
                 }
             }
-            SMTLOG("#%d\t%p\t%s\t%s\n", j+1, ai->bt[j], objectpath, functionname ? functionname : "(null)");
+            fprintf(f, "#%d\t%p\t%s\t%s\n", j+1, bt[j], objectpath, functionname ? functionname : "(null)");
         }
-        SMTLOG("MEMORYLEAK[%ld]###########################################################################\n", i+1);
+        lc += sz;
     }
-
-    freeSymbols(sl);
-
+    clock_gettime(CLOCK_REALTIME, &after);
+    SMTLOG("Use %lus and %luns and found %ld memory leak\n", after.tv_sec - before.tv_sec, after.tv_nsec - before.tv_nsec, i);
+    if (f)
+        fclose(f);
     return lc;
 }
 
 void tr_where(char c, void* p, size_t sz)
 {
-#define BTSZ 10
-#define BTAL 20
     void* bt[BTSZ];
-    if (!smtmap)
+    if (!mmap)
         return;
-
     use_origin_malloc = 1;
     if (c == '+') {
         backtrace(bt, BTSZ);
         pthread_mutex_lock(&maplock);
-        smtmap->append(p, sz, bt);
+        mmap->insert(std::pair<void*, MallocNode>(p, MallocNode(sz, bt)));
         pthread_mutex_unlock(&maplock);
     } else {
         pthread_mutex_lock(&maplock);
-        smtmap->remove(p);
+        mmap->erase(p);
         pthread_mutex_unlock(&maplock);
     }
     use_origin_malloc = 0;
@@ -427,20 +368,16 @@ static void* static_calloc(size_t size)
 {
     static char memory_pool[1024] = {0, };
     static size_t pool_index = 0;
-
     void* r = 0;
     if (size % 8)
         size += size % 8;
-
     if (pool_index >= 1024) {
         SMTLOG("*** memory pool is not enough\n");
         return 0;
     }
-
     r = memory_pool + pool_index + sizeof(size_t) + 2;
     *((size_t*)(memory_pool + pool_index)) = size;
     *(memory_pool + pool_index + sizeof(size_t) + 1) = '+';
-
     return r;
 }
 
@@ -454,9 +391,8 @@ void* calloc(size_t nitems, size_t size)
         malloc_hook();
     }
     r = libc_calloc(nitems, size);
-    if (!use_origin_malloc && r) {
+    if (!use_origin_malloc && r)
         tr_where('+', r, nitems*size);
-    }
     return r;
 }
 
@@ -468,9 +404,8 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
         malloc_hook();
     }
     r = libc_posix_memalign(memptr, alignment, size);
-    if (!use_origin_malloc && *memptr) {
+    if (!use_origin_malloc && *memptr)
         tr_where('+', *memptr, size);
-    }
     return r;
 }
 
@@ -482,9 +417,8 @@ void *aligned_alloc(size_t alignment, size_t size)
         malloc_hook();
     }
     r = libc_aligned_alloc(alignment, size);
-    if (!use_origin_malloc && r) {
+    if (!use_origin_malloc && r)
         tr_where('+', r, size);
-    }
     return r;
 }
 
@@ -497,9 +431,8 @@ void *memalign(size_t alignment, size_t size)
         sem_wait(&smtinit_sem);
     }
     r = libc_memalign(alignment, size);
-    if (!use_origin_malloc && r) {
+    if (!use_origin_malloc && r)
         tr_where('+', r, size);
-    }
     return r;
 }
 
@@ -511,9 +444,8 @@ void free(void* p)
             malloc_hook();
         }
         libc_free(p);
-        if (!use_origin_malloc) {
+        if (!use_origin_malloc)
             tr_where('-', p, 0);
-        }
     }
 }
 
@@ -525,9 +457,8 @@ void cfree(void* p)
             malloc_hook();
         }
         libc_cfree(p);
-        if (!use_origin_malloc) {
+        if (!use_origin_malloc)
             tr_where('-', p, 0);
-        }
     }
 }
 
