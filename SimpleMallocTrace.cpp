@@ -84,6 +84,7 @@ static sem_t smtinit_sem;
 static size_t detectmemoryleak();
 static char* getlogpath();
 static void malloc_hook();
+static void childafterfork();
 
 // simplemalloctrace_initialize will be called before main()
 static void __attribute__((constructor)) simplemalloctrace_initialize()
@@ -93,6 +94,7 @@ static void __attribute__((constructor)) simplemalloctrace_initialize()
         SMTLOG("Mutex init failed!\n");
         exit(1);
     }
+    pthread_atfork(0, 0, childafterfork);
 }
 
 // avoid dead lock in backtrace()
@@ -117,7 +119,7 @@ static void __attribute__((constructor)) simplemalloctrace_initialize()
 // #9 0x42227ce0 in backtrace () from /lib/libc.so.6
 // No symbol table info available.
 // #10 0xb551a47a in tr_where (c=43 '+', sz=4, p=0x9c840) at 
-static int __attribute__((constructor)) backtrace_init()
+static void __attribute__((constructor)) backtrace_init()
 {
     void* buffer[1];
     backtrace(buffer, 1);
@@ -146,6 +148,25 @@ static void __attribute__((destructor)) simplemalloctrace_finalize()
     } else
         SMTLOG(COLOR_GREEN"GOOD PROGRAM, NO MEMORY LEAK\n");
     SMTLOG(COLOR_NONE"\n");
+}
+
+static void childafterfork()
+{
+    SMTLOG("In a forked child, let's clean mmap and mutex\n");
+    pthread_mutex_unlock(&maplock);
+    pthread_mutex_destroy(&maplock);
+    if (pthread_mutex_init(&maplock, 0)) {
+        SMTLOG("fail to init mutex\n");
+        exit(1);
+    }
+    use_origin_malloc = 1;
+    mmap = new std::map<void*, MallocNode>();
+    if (!mmap) {
+        SMTLOG("fail to new mmap\n");
+        exit(1);
+    }
+    use_origin_malloc = 0;
+	SMTLOG("child process after fork callback done\n");
 }
 
 static void malloc_hook()
@@ -297,13 +318,13 @@ static size_t detectmemoryleak()
             cxaDemangled = info.dli_sname ? abi::__cxa_demangle(info.dli_sname, 0, 0, 0) : 0;
             functionname = cxaDemangled ? cxaDemangled : info.dli_sname ? info.dli_sname : 0;
             if (!functionname)
-                if (sit = smap.find(p), sit != smap.end())
+                if (sit = smap.find(bt[j]), sit != smap.end())
                     functionname = sit->second.c_str();
             if (!functionname) {
                 void* address = static_cast<char*>(bt[j]) - 1;
                 if (WTF::Symbolize(address, buf, sizeof(buf))) {
                     functionname = buf;
-                    smap.insert(std::pair<void*, std::string>(p, std::string(functionname)));
+                    smap.insert(std::pair<void*, std::string>(bt[j], std::string(functionname)));
                 }
             }
             fprintf(f, "#%d\t%p\t%s\t%s\n", j+1, bt[j], objectpath, functionname ? functionname : "(null)");

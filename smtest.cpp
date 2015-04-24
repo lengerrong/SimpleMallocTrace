@@ -87,6 +87,8 @@ main(int argc, char *argv[])
     stack_size = 0x10000000;
     num_threads = argc - 1;
 
+    fork();
+
     /* Initialize thread creation attributes */
 
     s = pthread_attr_init(&attr);
