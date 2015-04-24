@@ -2,6 +2,8 @@
 #define _GNU_SOURCE
 #endif 
 
+#include "Symbolize.h"
+
 #include <cxxabi.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -14,8 +16,6 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
-
-#include "Symbolize.h"
 
 using namespace std;
 using std::map;
