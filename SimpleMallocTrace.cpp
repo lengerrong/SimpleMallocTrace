@@ -16,10 +16,14 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <vector>
+
+#include "SimpleMallocTrace.h"
 
 using namespace std;
 using std::map;
 using std::string;
+using std::vector;
 
 extern "C" {
 
@@ -78,11 +82,61 @@ public:
     size_t sz;
     void* bt[BTSZ];
 };
-static std::map<void*, MallocNode>* mmap = 0;
+
+typedef std::map<void*, MallocNode> MMap;
+class SMTMap {
+public:
+    SMTMap()
+    {
+        startfile[0] = '\0';
+        startfunction[0] = '\0';
+        startline = -1;
+        stopfile[0] = 'm';
+        stopfile[1] = 'a';
+        stopfile[2] = 'i';
+        stopfile[3] = 'n';
+        stopfile[4] = '\0';
+        stopfunction[0] = 'm';
+        stopfunction[1] = 'a';
+        stopfunction[2] = 'i';
+        stopfunction[3] = 'n';
+        stopfunction[4] = '\0';
+        stopline = -1;
+    }
+    SMTMap(const char* file, const char* function, size_t line)
+    {
+        snprintf(startfile, sizeof(stopfile), "%s", file);
+        snprintf(startfunction, sizeof(stopfunction), "%s", function);
+        startline = line;
+    }
+    void insert(void* p, size_t sz, void** bt)
+    {
+        mmap.insert(std::pair<void*, MallocNode>(p, MallocNode(sz, bt)));
+    }
+    void erase(void* p)
+    {
+        mmap.erase(p);
+    }
+    void stopAt(const char* file, const char* function, size_t line)
+    {
+        snprintf(stopfile, sizeof(stopfile), "%s", file);
+        snprintf(stopfunction, sizeof(stopfunction), "%s", function);
+        stopline = line;
+    }
+    char startfile[PATH_MAX];
+    char startfunction[PATH_MAX];
+    size_t startline;
+    char stopfile[PATH_MAX];
+    char stopfunction[PATH_MAX];
+    size_t stopline;
+    MMap mmap;
+};
+
+static std::vector<SMTMap*>* smtmaplist = 0;
 static sem_t smtinit_sem;
 
-static size_t detectmemoryleak();
-static char* getlogpath();
+static void detectmemoryleak(SMTMap*);
+static char* getlogpath(SMTMap*);
 static void malloc_hook();
 static void childafterfork();
 
@@ -128,26 +182,22 @@ static void __attribute__((constructor)) backtrace_init()
 // simplemalloctrace_finalize will be called after main()
 static void __attribute__((destructor)) simplemalloctrace_finalize()
 {
-    size_t memoryleaked = 0;
     SMTLOG(COLOR_YELLOW"exit main function, let's check memory leak\n");
     pthread_mutex_destroy(&maplock);
     use_origin_malloc = 1;
-    if (mmap) {
-        memoryleaked = detectmemoryleak();
-        delete mmap;
-        mmap = 0;
+    if (smtmaplist) {
+        std::vector<SMTMap*>::iterator it;
+        for (it = smtmaplist->begin(); it != smtmaplist->end(); ++it) {
+            SMTMap* smtmap = *it;
+            if (smtmap) {
+                detectmemoryleak(smtmap);
+                delete smtmap;
+                smtmap = 0;
+            }
+        }
+        delete smtmaplist;
+        smtmaplist = 0;
     }
-    if (memoryleaked) {
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
-        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", memoryleaked);
-        SMTLOG(COLOR_RED"please check [%s] for more detail\n", getlogpath());
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
-    } else
-        SMTLOG(COLOR_GREEN"GOOD PROGRAM, NO MEMORY LEAK\n");
-    SMTLOG(COLOR_NONE"\n");
 }
 
 static void childafterfork()
@@ -160,10 +210,15 @@ static void childafterfork()
         exit(1);
     }
     use_origin_malloc = 1;
-    mmap = new std::map<void*, MallocNode>();
-    if (!mmap) {
+    smtmaplist = new std::vector<SMTMap*>();
+    if (!smtmaplist) {
         SMTLOG("fail to new mmap\n");
         exit(1);
+    }
+    SMTMap* globalmap = new SMTMap("before main()", "main()", 0);
+    if (globalmap) {
+        globalmap->stopAt("after main()", "main()", 0);
+        smtmaplist->push_back(globalmap);
     }
     use_origin_malloc = 0;
 	SMTLOG("child process after fork callback done\n");
@@ -253,18 +308,23 @@ static void malloc_hook()
     sem_post(&smtinit_sem);
     
     use_origin_malloc = 1;
-    mmap = new std::map<void*, MallocNode>();
-    if (!mmap) {
+    smtmaplist = new std::vector<SMTMap*>();
+    if (!smtmaplist) {
         SMTLOG("new AddressMap failed\n");
         exit(1);
+    }
+    SMTMap* globalmap = new SMTMap("before main()", "main()", 0);
+    if (globalmap) {
+        globalmap->stopAt("after main()", "main()", 0);
+        smtmaplist->push_back(globalmap);
     }
     use_origin_malloc = 0;
 }
 
-static char* getlogpath()
+static char* getlogpath(SMTMap* mmap)
 {
     static char logpath[PATH_MAX] = {0, };
-    if (!logpath[0]) {
+    memset(logpath, 0x0, sizeof(logpath));
         char pp[PATH_MAX];
         char buf[PATH_MAX];
         FILE* fp = 0;
@@ -274,29 +334,37 @@ static char* getlogpath()
         if (fp) {
             if (fgets(buf, sizeof(buf)-1, fp))
                 sscanf(buf, "%*s %s", pp);
-            sprintf(logpath, "%s.%d.memoryleak", pp, pid);
+            sprintf(logpath, "%s.%d.memoryleak.%p", pp, pid, mmap);
             fclose(fp);
         }
-    }
     return logpath;
 }
 
-static size_t detectmemoryleak()
+static void detectmemoryleak(SMTMap* smtmap)
 {
+    static std::map<void*, std::string> smap;
     size_t lc = 0;
     size_t i = 0;
     char buf[1024];
-    std::map<void*, std::string> smap;
     std::map<void*, std::string>::iterator sit;
     std::map<void*, MallocNode>::iterator it;
     FILE* f = 0;
     struct timespec before, after;
+    char* filepath = 0;
+    MMap* mmap = 0;
+    if (!smtmap)
+        return;
+    mmap = &(smtmap->mmap);
+    SMTLOG("Found [%ld] Memory Leak \n", mmap->size());
+    SMTLOG("From [%s %s %ld]\n", smtmap->startfile, smtmap->startfunction, smtmap->startline);
+    SMTLOG("To [%s %s %ld]\n", smtmap->stopfile, smtmap->stopfunction, smtmap->stopline);
     clock_gettime(CLOCK_REALTIME, &before);
     if (!mmap->empty()) {
-        f = fopen(getlogpath(), "w");
+        filepath = getlogpath(smtmap);
+        f = fopen(filepath, "w");
         if (!f) {
-            SMTLOG("*** Fail to open log file %s to write\n", getlogpath());
-            return 0;
+            SMTLOG("*** Fail to open log file %s to write\n", filepath);
+            return;
         }
     }
     for (it = mmap->begin(); it != mmap->end(); ++it) {
@@ -327,31 +395,50 @@ static size_t detectmemoryleak()
                     smap.insert(std::pair<void*, std::string>(bt[j], std::string(functionname)));
                 }
             }
-            fprintf(f, "#%d\t%p\t%s\t%s\n", j+1, bt[j], objectpath, functionname ? functionname : "(null)");
+            fprintf(f, "#%d\t%p\t%s\t%s\n", j+1, bt[j], objectpath ? objectpath : "(null)", functionname ? functionname : "(null)");
         }
         lc += sz;
     }
     clock_gettime(CLOCK_REALTIME, &after);
     SMTLOG("Use %lus and %luns and found %ld memory leak\n", after.tv_sec - before.tv_sec, after.tv_nsec - before.tv_nsec, i);
+    if (lc) {
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", lc);
+        SMTLOG(COLOR_RED"[%ld]bytes memory leak deteckted\n", lc);
+        SMTLOG(COLOR_RED"please check [%s] for more detail\n", filepath);
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+        SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
+    }
+    SMTLOG(COLOR_NONE"\n");
     if (f)
         fclose(f);
-    return lc;
 }
 
 void tr_where(char c, void* p, size_t sz)
 {
     void* bt[BTSZ];
-    if (!mmap)
+    std::vector<SMTMap*>::iterator it;
+    SMTMap* smtmap = 0;
+    if (!smtmaplist || smtmaplist->empty())
         return;
     use_origin_malloc = 1;
     if (c == '+') {
         backtrace(bt, BTSZ);
         pthread_mutex_lock(&maplock);
-        mmap->insert(std::pair<void*, MallocNode>(p, MallocNode(sz, bt)));
+        for (it = smtmaplist->begin(); it != smtmaplist->end(); ++it) {
+            smtmap = *it;
+            if (smtmap)
+                smtmap->insert(p, sz, bt);
+        }
         pthread_mutex_unlock(&maplock);
     } else {
         pthread_mutex_lock(&maplock);
-        mmap->erase(p);
+        for (it = smtmaplist->begin(); it != smtmaplist->end(); ++it) {
+            smtmap = *it;
+            if (smtmap)
+                smtmap->erase(p);
+        }
         pthread_mutex_unlock(&maplock);
     }
     use_origin_malloc = 0;
@@ -481,6 +568,46 @@ void cfree(void* p)
         if (!use_origin_malloc)
             tr_where('-', p, 0);
     }
+}
+
+size_t smtstart(const char* file, const char* function, size_t line)
+{
+    size_t index = -1;
+    SMTLOG("start simple trace malloc from [%s, %s, %ld]\n", file, function, line);
+    if (smtmaplist) {
+        use_origin_malloc = 1;
+        SMTMap* smtmap = new SMTMap(file, function, line);
+        if (smtmap) {
+            pthread_mutex_lock(&maplock);
+            smtmaplist->push_back(smtmap);
+            index = smtmaplist->size() - 1;
+            pthread_mutex_unlock(&maplock);
+        }
+        use_origin_malloc = 0;
+    }
+    return index;
+}
+
+void smtstop(size_t index, const char* file, const char* function, size_t line)
+{
+    SMTLOG("stop simple trace malloc from [%s, %s, %ld]\n", file, function, line);
+    SMTMap* smtmap = 0;
+    pthread_mutex_lock(&maplock);
+    if (!smtmaplist || index >= smtmaplist->size()  || !(smtmap = (*smtmaplist)[index])) {
+        pthread_mutex_unlock(&maplock);
+        return;
+    }
+    (*smtmaplist)[index] = 0;
+    pthread_mutex_unlock(&maplock);
+    SMTLOG("Let's detect memory leak\n");
+    SMTLOG("From [%s %s %ld]\n", smtmap->startfile, smtmap->startfunction, smtmap->startline);
+    SMTLOG("To [%s %s %ld]\n", file, function, line);
+    smtmap->stopAt(file, function, line);
+    detectmemoryleak(smtmap);
+    use_origin_malloc = 1;
+    delete smtmap;
+    smtmap = 0;
+    use_origin_malloc = 0;
 }
 
 }
