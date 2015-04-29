@@ -15,6 +15,7 @@
 #include <string>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -382,7 +383,8 @@ static void detectmemoryleak(SMTMap* smtmap)
             if (!bt[j])
                 break;
             dladdr(bt[j], &info);
-            objectpath = info.dli_fname ? info.dli_fname : "(nul)";
+            objectpath = info.dli_fname ? info.dli_fname : 0;
+#if USE_WTF_SYMBOLIZE
             cxaDemangled = info.dli_sname ? abi::__cxa_demangle(info.dli_sname, 0, 0, 0) : 0;
             functionname = cxaDemangled ? cxaDemangled : info.dli_sname ? info.dli_sname : 0;
             if (!functionname)
@@ -395,6 +397,9 @@ static void detectmemoryleak(SMTMap* smtmap)
                     smap.insert(std::pair<void*, std::string>(bt[j], std::string(functionname)));
                 }
             }
+#else
+            functionname = info.dli_sname ? info.dli_sname : 0;
+#endif
             fprintf(f, "#%d\t%p\t%s\t%s\n", j+1, bt[j], objectpath ? objectpath : "(null)", functionname ? functionname : "(null)");
         }
         lc += sz;
@@ -411,8 +416,23 @@ static void detectmemoryleak(SMTMap* smtmap)
         SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
     }
     SMTLOG(COLOR_NONE"\n");
-    if (f)
+    if (f) {
+#if !USE_WTF_SYMBOLIZE
+        char mapfile[PATH_MAX];
+        char newmapfile[PATH_MAX];
+        char workdir[PATH_MAX];
+        char cmd[PATH_MAX*4] = {0, };
+        snprintf(mapfile, sizeof(mapfile), "/proc/%d/maps", getpid());
+        snprintf(newmapfile, sizeof(newmapfile), "%s.maps", filepath);
+        snprintf(cmd, sizeof(cmd), "cp %s %s", mapfile, newmapfile);
+        getcwd(workdir, sizeof(workdir));
+        SMTLOG("Copy %s to %s\n", mapfile, newmapfile);
+        system(cmd);
+        SMTLOG("Please use below command and try to find the memory leak line in your source file\n");
+        SMTLOG("smtaddr2line.sh %s %s %s\n", filepath, newmapfile, workdir);
+#endif
         fclose(f);
+    }
 }
 
 void tr_where(char c, void* p, size_t sz)
@@ -429,7 +449,7 @@ void tr_where(char c, void* p, size_t sz)
         for (it = smtmaplist->begin(); it != smtmaplist->end(); ++it) {
             smtmap = *it;
             if (smtmap)
-                smtmap->insert(p, sz, bt);
+                smtmap->insert(p, sz, bt+2);
         }
         pthread_mutex_unlock(&maplock);
     } else {
