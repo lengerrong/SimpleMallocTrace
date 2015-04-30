@@ -74,10 +74,11 @@ public:
         : sz(0)
     {
     }
-    MallocNode(size_t _sz, void* _bt[])
+    MallocNode(size_t _sz, void* _bt[], size_t len)
         : sz(_sz)
     {
-        memcpy(bt, _bt, sizeof(bt));
+        size_t sz = len <= BTSZ ? len : BTSZ;
+        memcpy(bt, _bt, sz*sizeof(void*));
     }
 public:
     size_t sz;
@@ -110,9 +111,9 @@ public:
         snprintf(startfunction, sizeof(stopfunction), "%s", function);
         startline = line;
     }
-    void insert(void* p, size_t sz, void** bt)
+    void insert(void* p, size_t sz, void** bt, size_t len)
     {
-        mmap.insert(std::pair<void*, MallocNode>(p, MallocNode(sz, bt)));
+        mmap.insert(std::pair<void*, MallocNode>(p, MallocNode(sz, bt, len)));
     }
     void erase(void* p)
     {
@@ -341,11 +342,35 @@ static char* getlogpath(SMTMap* mmap)
     return logpath;
 }
 
+void copymaps(char* filepath)
+{
+    char mapfile[] = "/proc/self/maps";
+    char newmapfile[PATH_MAX];
+    snprintf(newmapfile, sizeof(newmapfile), "%s.maps", filepath);
+    FILE* rf = fopen(mapfile, "r");
+    if (rf) {
+        FILE* wf = fopen(newmapfile, "w");
+        if (wf) {
+            char buffer[256];
+            size_t rsz;
+            while (rsz = fread(buffer, 1, sizeof(buffer), rf))
+                fwrite(buffer, rsz, 1, wf);
+            fclose(wf);
+        }
+        fclose(rf);
+    }
+    SMTLOG("Copy %s to %s\n", mapfile, newmapfile);
+    SMTLOG("Please use below command and try to find the memory leak line in your source file\n");
+    SMTLOG("smtaddr2line.sh %s %s %s\n", filepath, newmapfile, "/ #one specific directory that contains current current process's excutable binary and linked shared libraies");
+}
+
 static void detectmemoryleak(SMTMap* smtmap)
 {
     static std::map<void*, std::string> smap;
+    std::map<std::string, void*> btmap;
     size_t lc = 0;
     size_t i = 0;
+    size_t si = 0;
     char buf[1024];
     std::map<void*, std::string>::iterator sit;
     std::map<void*, MallocNode>::iterator it;
@@ -373,6 +398,20 @@ static void detectmemoryleak(SMTMap* smtmap)
         size_t sz = it->second.sz;
         void** bt = it->second.bt;
         int j;
+        lc += sz;
+        std::string btstr;
+        for (j = 0; j < BTSZ; j++) {
+            if (!bt[j])
+                break;
+            char buffer[BTAL];
+            snprintf(buffer, sizeof(buffer), "%p", bt[j]);
+            btstr.append(buffer);
+        }
+        if (btmap.find(btstr) != btmap.end()) {
+            si++;
+            continue;
+        }
+        btmap.insert(std::pair<std::string, void*>(btstr, p));
         i++;
         fprintf(f, "MEMORYLEAK[%ld][%p, %ld] with BT:\n", i, p, sz);
         for (j = 0; j < BTSZ; j++) {
@@ -402,10 +441,9 @@ static void detectmemoryleak(SMTMap* smtmap)
 #endif
             fprintf(f, "#%d\t%p\t%s\t%s\n", j+1, bt[j], objectpath ? objectpath : "(null)", functionname ? functionname : "(null)");
         }
-        lc += sz;
     }
     clock_gettime(CLOCK_REALTIME, &after);
-    SMTLOG("Use %lus and %luns and found %ld memory leak\n", after.tv_sec - before.tv_sec, after.tv_nsec - before.tv_nsec, i);
+    SMTLOG("Use %lus and %luns to find memory leak, %ld same memory leak\n", after.tv_sec - before.tv_sec, after.tv_nsec - before.tv_nsec, si);
     if (lc) {
         SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
         SMTLOG(COLOR_RED"!!!!!!ERROR ERROR ERROR!!!!!!\n");
@@ -418,18 +456,7 @@ static void detectmemoryleak(SMTMap* smtmap)
     SMTLOG(COLOR_NONE"\n");
     if (f) {
 #if !USE_WTF_SYMBOLIZE
-        char mapfile[PATH_MAX];
-        char newmapfile[PATH_MAX];
-        char workdir[PATH_MAX];
-        char cmd[PATH_MAX*4] = {0, };
-        snprintf(mapfile, sizeof(mapfile), "/proc/%d/maps", getpid());
-        snprintf(newmapfile, sizeof(newmapfile), "%s.maps", filepath);
-        snprintf(cmd, sizeof(cmd), "cp %s %s", mapfile, newmapfile);
-        getcwd(workdir, sizeof(workdir));
-        SMTLOG("Copy %s to %s\n", mapfile, newmapfile);
-        system(cmd);
-        SMTLOG("Please use below command and try to find the memory leak line in your source file\n");
-        SMTLOG("smtaddr2line.sh %s %s %s\n", filepath, newmapfile, workdir);
+        copymaps(filepath);
 #endif
         fclose(f);
     }
@@ -444,12 +471,12 @@ void tr_where(char c, void* p, size_t sz)
         return;
     use_origin_malloc = 1;
     if (c == '+') {
-        backtrace(bt, BTSZ);
+        size_t btsz = backtrace(bt, BTSZ);
         pthread_mutex_lock(&maplock);
         for (it = smtmaplist->begin(); it != smtmaplist->end(); ++it) {
             smtmap = *it;
             if (smtmap)
-                smtmap->insert(p, sz, bt+2);
+                smtmap->insert(p, sz, bt+2, btsz - 2);
         }
         pthread_mutex_unlock(&maplock);
     } else {
