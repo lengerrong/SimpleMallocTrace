@@ -73,10 +73,12 @@ public:
     MallocNode()
         : sz(0)
     {
+        memset(bt, 0x0, sizeof(bt));
     }
     MallocNode(size_t _sz, void* _bt[], size_t len)
         : sz(_sz)
     {
+        memset(bt, 0x0, sizeof(bt));
         size_t sz = len <= BTSZ ? len : BTSZ;
         memcpy(bt, _bt, sz*sizeof(void*));
     }
