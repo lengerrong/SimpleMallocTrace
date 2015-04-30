@@ -93,9 +93,10 @@ if [ -f "$1" ]; then
                     if [ "$3" != "" ] ;then
                         if [ -d "$3" ]; then
                             filename=`basename "$al"`
-                            nal=`find "$3" -name "$filename"`
-                            if [ -f "$nal" ]; then
-                                binary="$nal"
+                            nal=(`find "$3" -name "$filename" -type f -o -type l`)
+                            nall=${#nal[@]}
+                            if [ $nall -gt 0 ]; then
+                                binary=${nal[0]}
                             fi
                         fi
                     fi
